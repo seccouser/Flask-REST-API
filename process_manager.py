@@ -242,7 +242,7 @@ class ProcessManager:
         
         # Clean up stale entries
         stale_processes = []
-        for process_name, pid in self.managed_processes.items():
+        for process_name, pid in list(self.managed_processes.items()):
             if not psutil.pid_exists(pid):
                 stale_processes.append(process_name)
         
@@ -250,7 +250,7 @@ class ProcessManager:
             del self.managed_processes[process_name]
         
         # Get status for all managed processes
-        for process_name in self.managed_processes.keys():
+        for process_name in list(self.managed_processes.keys()):
             status = self.get_process_status(process_name)
             processes.append(status)
         
