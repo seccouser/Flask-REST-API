@@ -56,8 +56,8 @@ class KeyboardEmulator:
         except PermissionError:
             logger.error("Permission denied to access /dev/uinput. Run as root or add user to input group.")
             raise
-        except Exception as e:
-            logger.error(f"Failed to create virtual keyboard: {e}")
+        except Exception as ex:
+            logger.error(f"Failed to create virtual keyboard: {ex}")
             raise
     
     def __del__(self):
@@ -101,8 +101,8 @@ class KeyboardEmulator:
             if delay > 0:
                 time.sleep(delay)
                 
-        except Exception as e:
-            logger.error(f"Error sending key {key_name}: {e}")
+        except Exception as ex:
+            logger.error(f"Error sending key {key_name}: {ex}")
             raise
     
     def send_key_combination(self, keys, delay=0.1):
@@ -138,8 +138,8 @@ class KeyboardEmulator:
             if delay > 0:
                 time.sleep(delay)
                 
-        except Exception as e:
-            logger.error(f"Error sending key combination {keys}: {e}")
+        except Exception as ex:
+            logger.error(f"Error sending key combination {keys}: {ex}")
             raise
     
     def type_char(self, char, delay=0.05):
@@ -198,8 +198,8 @@ class KeyboardEmulator:
             if delay > 0:
                 time.sleep(delay)
                 
-        except Exception as e:
-            logger.error(f"Error typing character '{char}': {e}")
+        except Exception as ex:
+            logger.error(f"Error typing character '{char}': {ex}")
             raise
     
     def type_text(self, text, delay=0.05):
