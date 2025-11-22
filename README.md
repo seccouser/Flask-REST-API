@@ -249,6 +249,154 @@ Alle Standard-Linux-Tastencodes aus dem evdev-Modul, z.B.:
 - Navigation: `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`
 - Sonstige: `KEY_ENTER`, `KEY_TAB`, `KEY_SPACE`, `KEY_BACKSPACE`, `KEY_ESC`
 
+### 7. Prozess starten
+```
+POST /process/start
+```
+
+Startet einen Prozess und überprüft optional, ob er bereits läuft.
+
+**JSON-Parameter:**
+- `command` (erforderlich): Befehl als String oder Array (z.B., "firefox" oder ["python3", "script.py"])
+- `check_running` (optional): Überprüfen, ob bereits läuft (default: true)
+- `cwd` (optional): Arbeitsverzeichnis für den Prozess
+- `env` (optional): Umgebungsvariablen als Dictionary
+
+**Beispiele:**
+```bash
+# Einfacher Befehl
+curl -X POST http://localhost:5000/process/start \
+  -H "Content-Type: application/json" \
+  -d '{"command": "firefox"}'
+
+# Befehl mit Argumenten
+curl -X POST http://localhost:5000/process/start \
+  -H "Content-Type: application/json" \
+  -d '{"command": ["python3", "/path/to/script.py", "--arg1"]}'
+
+# Mit Arbeitsverzeichnis
+curl -X POST http://localhost:5000/process/start \
+  -H "Content-Type: application/json" \
+  -d '{"command": "npm start", "cwd": "/home/user/myapp"}'
+
+# Prozess immer neu starten (ignoriert laufende Instanz)
+curl -X POST http://localhost:5000/process/start \
+  -H "Content-Type: application/json" \
+  -d '{"command": "gedit", "check_running": false}'
+```
+
+**Response:**
+```json
+{
+  "status": "started",
+  "pid": 12345,
+  "process": "firefox",
+  "command": "firefox",
+  "message": "Process started successfully with PID 12345"
+}
+```
+
+Wenn Prozess bereits läuft:
+```json
+{
+  "status": "already_running",
+  "pid": 12340,
+  "process": "firefox",
+  "message": "Process is already running with PID 12340"
+}
+```
+
+### 8. Prozess stoppen
+```
+POST /process/stop
+```
+
+Stoppt einen laufenden Prozess.
+
+**JSON-Parameter:**
+- `process` (erforderlich): Prozessname
+
+**Beispiel:**
+```bash
+curl -X POST http://localhost:5000/process/stop \
+  -H "Content-Type: application/json" \
+  -d '{"process": "firefox"}'
+```
+
+**Response:**
+```json
+{
+  "status": "stopped",
+  "pid": 12345,
+  "process": "firefox",
+  "message": "Process stopped successfully (PID 12345)"
+}
+```
+
+### 9. Prozess-Status abfragen
+```
+GET /process/status/<process_name>
+```
+
+Gibt den Status eines Prozesses zurück.
+
+**Beispiel:**
+```bash
+curl http://localhost:5000/process/status/firefox
+```
+
+**Response:**
+```json
+{
+  "running": true,
+  "process": "firefox",
+  "pid": 12345,
+  "status": "running",
+  "cpu_percent": 5.2,
+  "memory_mb": 450.5,
+  "create_time": 1700000000.0
+}
+```
+
+### 10. Verwaltete Prozesse auflisten
+```
+GET /process/list
+```
+
+Listet alle vom API verwalteten Prozesse.
+
+**Beispiel:**
+```bash
+curl http://localhost:5000/process/list
+```
+
+**Response:**
+```json
+{
+  "count": 2,
+  "processes": [
+    {
+      "running": true,
+      "process": "firefox",
+      "pid": 12345,
+      "status": "running",
+      "cpu_percent": 5.2,
+      "memory_mb": 450.5,
+      "create_time": 1700000000.0
+    },
+    {
+      "running": true,
+      "process": "gedit",
+      "pid": 12346,
+      "status": "running",
+      "cpu_percent": 0.5,
+      "memory_mb": 50.2,
+      "create_time": 1700000100.0
+    }
+  ]
+}
+```
+
 ## Python-Client-Beispiel
 
 ```python

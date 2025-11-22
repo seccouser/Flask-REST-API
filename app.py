@@ -22,6 +22,14 @@ except ImportError:
     KEYBOARD_AVAILABLE = False
     logging.warning("Keyboard emulation not available - evdev module not found")
 
+# Import process manager module
+try:
+    from process_manager import ProcessManager
+    PROCESS_MANAGER_AVAILABLE = True
+except ImportError:
+    PROCESS_MANAGER_AVAILABLE = False
+    logging.warning("Process manager not available - psutil module not found")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +60,15 @@ if KEYBOARD_AVAILABLE:
         logger.info("Keyboard emulator initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize keyboard emulator: {e}")
+
+# Initialize process manager if available
+process_manager = None
+if PROCESS_MANAGER_AVAILABLE:
+    try:
+        process_manager = ProcessManager()
+        logger.info("Process manager initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize process manager: {e}")
 
 
 def calculate_file_hash(filepath, algorithm='sha256'):
@@ -313,6 +330,147 @@ def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
 
+@app.route('/process/start', methods=['POST'])
+def start_process():
+    """
+    Start a process and check if it's already running.
+    
+    JSON body:
+    {
+        "command": "command to run" or ["command", "arg1", "arg2"],
+        "check_running": true (optional, default true),
+        "cwd": "/path/to/working/dir" (optional),
+        "env": {"VAR": "value"} (optional)
+    }
+    
+    Returns:
+        JSON response with process status
+    """
+    if not PROCESS_MANAGER_AVAILABLE or process_manager is None:
+        return jsonify({
+            'error': 'Process management not available',
+            'message': 'psutil module not installed'
+        }), 503
+    
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        command = data.get('command')
+        if not command:
+            return jsonify({'error': '"command" is required'}), 400
+        
+        check_running = data.get('check_running', True)
+        cwd = data.get('cwd')
+        env = data.get('env')
+        
+        result = process_manager.start_process(
+            command=command,
+            check_running=check_running,
+            cwd=cwd,
+            env=env
+        )
+        
+        return jsonify(result)
+        
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        logger.error(f"Process start error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/process/stop', methods=['POST'])
+def stop_process():
+    """
+    Stop a running process.
+    
+    JSON body:
+    {
+        "process": "process name or command"
+    }
+    
+    Returns:
+        JSON response with status
+    """
+    if not PROCESS_MANAGER_AVAILABLE or process_manager is None:
+        return jsonify({
+            'error': 'Process management not available',
+            'message': 'psutil module not installed'
+        }), 503
+    
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        process_name = data.get('process')
+        if not process_name:
+            return jsonify({'error': '"process" is required'}), 400
+        
+        result = process_manager.stop_process(process_name)
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Process stop error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/process/status/<process_name>', methods=['GET'])
+def get_process_status(process_name):
+    """
+    Get status of a process.
+    
+    Args:
+        process_name: Name of the process
+        
+    Returns:
+        JSON response with process status
+    """
+    if not PROCESS_MANAGER_AVAILABLE or process_manager is None:
+        return jsonify({
+            'error': 'Process management not available',
+            'message': 'psutil module not installed'
+        }), 503
+    
+    try:
+        result = process_manager.get_process_status(process_name)
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Process status error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/process/list', methods=['GET'])
+def list_processes():
+    """
+    List all managed processes.
+    
+    Returns:
+        JSON response with list of processes
+    """
+    if not PROCESS_MANAGER_AVAILABLE or process_manager is None:
+        return jsonify({
+            'error': 'Process management not available',
+            'message': 'psutil module not installed'
+        }), 503
+    
+    try:
+        processes = process_manager.list_managed_processes()
+        return jsonify({
+            'processes': processes,
+            'count': len(processes)
+        })
+        
+    except Exception as e:
+        logger.error(f"Process list error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     # Run the server
     # For production, use a proper WSGI server like gunicorn
@@ -323,5 +481,6 @@ if __name__ == '__main__':
     logger.info(f"Starting Flask REST API on {host}:{port}")
     logger.info(f"Upload folder: {UPLOAD_FOLDER}")
     logger.info(f"Keyboard emulation: {'enabled' if KEYBOARD_AVAILABLE else 'disabled'}")
+    logger.info(f"Process management: {'enabled' if PROCESS_MANAGER_AVAILABLE else 'disabled'}")
     
     app.run(host=host, port=port, debug=debug)
