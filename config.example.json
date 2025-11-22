@@ -1,6 +1,3 @@
-# Flask REST API Configuration Example
-# Copy this file to config.json and adjust settings as needed
-
 {
   "upload_folder": "uploads",
   "max_content_length": 104857600,

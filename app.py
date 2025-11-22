@@ -243,8 +243,8 @@ def keyboard_input():
     JSON body:
     {
         "text": "string to type",
-        "keys": ["KEY_A", "KEY_ENTER"],  // alternative: specific key codes
-        "delay": 0.1  // optional delay between keys in seconds
+        "keys": ["KEY_A", "KEY_ENTER"],
+        "delay": 0.1
     }
     
     Returns:

@@ -65,7 +65,7 @@ class KeyboardEmulator:
         if hasattr(self, 'ui'):
             try:
                 self.ui.close()
-            except:
+            except Exception:
                 pass
     
     def send_key(self, key_name, delay=0.1):

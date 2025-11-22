@@ -27,7 +27,9 @@ apt-get install -y python3 python3-pip python3-dev git
 
 # Install system dependencies for evdev
 echo "Installing evdev system dependencies..."
-apt-get install -y gcc linux-headers-$(uname -r) || true
+if ! apt-get install -y gcc linux-headers-$(uname -r); then
+    echo "Warning: Could not install linux-headers. Keyboard emulation may not work."
+fi
 
 # Create installation directory
 INSTALL_DIR="/opt/Flask-REST-API"
@@ -36,11 +38,12 @@ mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
 # Copy files if running from a different directory
-if [ "$PWD" != "$INSTALL_DIR" ]; then
-    echo "Copying application files..."
-    cp /home/runner/work/Flask-REST-API/Flask-REST-API/*.py $INSTALL_DIR/ 2>/dev/null || true
-    cp /home/runner/work/Flask-REST-API/Flask-REST-API/requirements.txt $INSTALL_DIR/ 2>/dev/null || true
-    cp /home/runner/work/Flask-REST-API/Flask-REST-API/flask-api.service /etc/systemd/system/ 2>/dev/null || true
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    echo "Copying application files from $SCRIPT_DIR..."
+    cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR"/flask-api.service /etc/systemd/system/ 2>/dev/null || true
 fi
 
 # Install Python dependencies

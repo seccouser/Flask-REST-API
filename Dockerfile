@@ -1,10 +1,9 @@
 FROM python:3.11-slim
 
 # Install system dependencies for evdev
-RUN apt-get update && apt-get install -y \
-    gcc \
-    linux-headers-generic || true \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y gcc && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
