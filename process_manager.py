@@ -101,18 +101,27 @@ class ProcessManager:
         
         # Start the process
         try:
-            # Merge environment variables
+            # Merge environment variables - preserve DISPLAY for GUI apps
             proc_env = os.environ.copy()
+            
+            # Ensure DISPLAY is set for GUI applications
+            if 'DISPLAY' not in proc_env:
+                proc_env['DISPLAY'] = ':0'
+            
             if env:
                 proc_env.update(env)
             
+            # Use devnull for stdout/stderr to avoid zombie processes
+            # GUI applications need to run independently
             process = subprocess.Popen(
                 cmd_list,
                 cwd=cwd,
                 env=proc_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True  # Detach from parent
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,  # Detach from parent
+                preexec_fn=os.setpgrp if hasattr(os, 'setpgrp') else None  # Create new process group
             )
             
             pid = process.pid

@@ -306,6 +306,12 @@ Wenn Prozess bereits läuft:
 }
 ```
 
+**Hinweise für GUI-Anwendungen:**
+- GUI-Anwendungen werden automatisch mit der korrekten DISPLAY-Variable gestartet
+- Die Prozesse laufen unabhängig vom API-Server (detached)
+- Ausgaben werden nicht erfasst, um Zombie-Prozesse zu vermeiden
+- Prozesse überleben den API-Server-Neustart und laufen weiter
+
 ### 8. Prozess stoppen
 ```
 POST /process/stop
