@@ -19,7 +19,10 @@ fi
 # Update system
 echo "Updating system packages..."
 apt-get update
-apt-get upgrade -y
+
+# Try to upgrade, but don't fail if it doesn't work (e.g., mirror sync issues)
+echo "Attempting system upgrade (optional, continuing on failure)..."
+apt-get upgrade -y || echo "Warning: System upgrade failed, but continuing installation..."
 
 # Install Python and pip if not installed
 echo "Installing Python and dependencies..."
