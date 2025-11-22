@@ -1,0 +1,19 @@
+# Flask REST API Configuration Example
+# Copy this file to config.json and adjust settings as needed
+
+{
+  "upload_folder": "uploads",
+  "max_content_length": 104857600,
+  "allowed_extensions": [],
+  "host": "0.0.0.0",
+  "port": 5000,
+  "debug": false,
+  "keyboard_emulation": {
+    "enabled": true,
+    "default_delay": 0.1
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  }
+}
