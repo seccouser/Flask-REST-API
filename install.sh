@@ -38,16 +38,40 @@ fi
 INSTALL_DIR="/opt/Flask-REST-API"
 echo "Creating installation directory: $INSTALL_DIR"
 mkdir -p $INSTALL_DIR
-cd $INSTALL_DIR
 
 # Copy files if running from a different directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "Script directory: $SCRIPT_DIR"
+echo "Installation directory: $INSTALL_DIR"
+
 if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
-    echo "Copying application files from $SCRIPT_DIR..."
-    cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/" 2>/dev/null || true
-    cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/" 2>/dev/null || true
-    cp "$SCRIPT_DIR"/flask-api.service /etc/systemd/system/ 2>/dev/null || true
+    echo "Copying application files from $SCRIPT_DIR to $INSTALL_DIR..."
+    
+    # Copy Python files
+    if ! cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/" 2>/dev/null; then
+        echo "Warning: Could not copy Python files"
+    fi
+    
+    # Copy requirements.txt (critical file)
+    if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+        cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
+        echo "✓ Copied requirements.txt"
+    else
+        echo "Error: requirements.txt not found in $SCRIPT_DIR"
+        exit 1
+    fi
+    
+    # Copy service file
+    if [ -f "$SCRIPT_DIR/flask-api.service" ]; then
+        cp "$SCRIPT_DIR/flask-api.service" /etc/systemd/system/
+        echo "✓ Copied flask-api.service"
+    else
+        echo "Warning: flask-api.service not found"
+    fi
 fi
+
+# Change to installation directory
+cd $INSTALL_DIR
 
 # Create and activate virtual environment
 echo "Creating Python virtual environment..."
