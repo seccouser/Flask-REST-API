@@ -113,6 +113,7 @@ class ProcessManager:
             
             # Use devnull for stdout/stderr to avoid zombie processes
             # GUI applications need to run independently
+            # start_new_session=True creates new process group AND session (better than setpgrp)
             process = subprocess.Popen(
                 cmd_list,
                 cwd=cwd,
@@ -120,8 +121,7 @@ class ProcessManager:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,  # Detach from parent
-                preexec_fn=os.setpgrp if hasattr(os, 'setpgrp') else None  # Create new process group
+                start_new_session=True  # Detach from parent, creates new process group & session
             )
             
             pid = process.pid
