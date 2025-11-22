@@ -355,7 +355,7 @@ sudo usermod -a -G input $USER
 
 ```bash
 # evdev installieren
-pip install python-evdev
+pip install evdev
 
 # Auf Armbian/Debian
 sudo apt-get install python3-evdev

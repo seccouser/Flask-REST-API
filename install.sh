@@ -130,7 +130,7 @@ echo "Testing evdev installation..."
 
 if [ $EVDEV_OK -eq 0 ]; then
     echo "Warning: evdev not installed properly. Keyboard emulation may not work."
-    echo "Try: ./venv/bin/pip install --upgrade python-evdev"
+    echo "Try: ./venv/bin/pip install --upgrade evdev"
 fi
 
 echo ""
