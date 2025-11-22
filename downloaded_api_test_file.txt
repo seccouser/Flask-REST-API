@@ -1,3 +1,0 @@
-Dies ist eine Test-Datei für die Flask REST API.
-Sie enthält mehrere Zeilen Text.
-Und wird für Upload/Download-Tests verwendet.
