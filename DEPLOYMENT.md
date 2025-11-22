@@ -46,9 +46,15 @@ sudo apt-get install -y gcc linux-headers-$(uname -r)
 git clone https://github.com/seccouser/Flask-REST-API.git
 cd Flask-REST-API
 
+# Virtuelle Umgebung erstellen (für Python 3.11+ erforderlich)
+python3 -m venv venv
+source venv/bin/activate
+
 # Python-Abhängigkeiten installieren
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
+
+**Hinweis für Python 3.11+**: Moderne Python-Versionen verwenden PEP 668 und verhindern systemweite pip-Installationen. Eine virtuelle Umgebung ist erforderlich.
 
 #### 3. uinput für Tastatur-Emulation konfigurieren
 
@@ -80,13 +86,20 @@ sudo usermod -a -G input $USER
 
 ```bash
 # Im Projektverzeichnis
+cd /opt/Flask-REST-API
+
+# Mit virtueller Umgebung
+./venv/bin/python3 app.py
+
+# Oder nach Aktivierung der virtuellen Umgebung
+source venv/bin/activate
 python3 app.py
 
 # Mit benutzerdefinierten Einstellungen
-FLASK_HOST=0.0.0.0 FLASK_PORT=8080 python3 app.py
+FLASK_HOST=0.0.0.0 FLASK_PORT=8080 ./venv/bin/python3 app.py
 
 # Im Hintergrund mit nohup
-nohup python3 app.py > flask-api.log 2>&1 &
+nohup ./venv/bin/python3 app.py > flask-api.log 2>&1 &
 ```
 
 ### Als systemd-Service (empfohlen für Produktion)
@@ -328,6 +341,49 @@ sudo crontab -e
 
 ## Fehlerbehebung
 
+### PEP 668 - Externally Managed Environment Error
+
+Wenn Sie den Fehler "externally-managed-environment" erhalten:
+
+```bash
+error: externally-managed-environment
+
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install
+    python3-xyz...
+```
+
+**Lösung 1: Virtuelle Umgebung verwenden (empfohlen)**
+```bash
+# Virtuelle Umgebung erstellen
+python3 -m venv venv
+source venv/bin/activate
+
+# Abhängigkeiten installieren
+pip install -r requirements.txt
+
+# Server starten
+python3 app.py
+```
+
+**Lösung 2: Automatisches Installationsskript verwenden**
+```bash
+# Das install.sh Skript erstellt automatisch eine virtuelle Umgebung
+sudo bash install.sh
+```
+
+**Lösung 3: System-Packages verwenden (begrenzt)**
+```bash
+# Nur grundlegende Pakete verfügbar
+sudo apt install python3-flask python3-flask-cors
+```
+
+**Nicht empfohlen: --break-system-packages**
+```bash
+# Kann das System beschädigen!
+pip install -r requirements.txt --break-system-packages
+```
+
 ### Server startet nicht
 
 ```bash
@@ -337,8 +393,9 @@ sudo journalctl -u flask-api -n 50
 # Port bereits in Verwendung?
 sudo lsof -i :5000
 
-# Python-Abhängigkeiten überprüfen
-pip3 list | grep -i flask
+# Python-Abhängigkeiten überprüfen (in venv)
+source venv/bin/activate
+pip list | grep -i flask
 ```
 
 ### Tastatur-Emulation funktioniert nicht
@@ -350,11 +407,12 @@ lsmod | grep uinput
 # Berechtigungen überprüfen
 ls -l /dev/uinput
 
-# evdev installiert?
+# evdev installiert? (in venv)
+source venv/bin/activate
 python3 -c "import evdev; print('OK')"
 
 # Als root starten (temporär)
-sudo python3 app.py
+sudo ./venv/bin/python3 app.py
 ```
 
 ### Hohe CPU-Last

@@ -21,14 +21,36 @@ Eine Flask-basierte REST-API für Dateiübertragungen mit Hash-Verifizierung und
 
 ## Installation
 
+### Option 1: Automatische Installation (empfohlen)
+
+```bash
+# Als root oder mit sudo
+sudo bash install.sh
+```
+
+Das Skript erstellt automatisch eine virtuelle Umgebung und installiert alle Abhängigkeiten.
+
+### Option 2: Manuelle Installation
+
 1. Repository klonen:
 ```bash
 git clone https://github.com/seccouser/Flask-REST-API.git
 cd Flask-REST-API
 ```
 
-2. Abhängigkeiten installieren:
+2. Virtuelle Umgebung erstellen (empfohlen für Python 3.11+):
 ```bash
+# Python 3.11+ benötigt eine virtuelle Umgebung
+python3 -m venv venv
+source venv/bin/activate
+
+# Abhängigkeiten installieren
+pip install -r requirements.txt
+```
+
+**Alternative (nicht empfohlen):** Systemweite Installation auf älteren Systemen:
+```bash
+# Nur auf Python < 3.11 oder mit --break-system-packages (nicht empfohlen)
 pip install -r requirements.txt
 ```
 
@@ -46,8 +68,20 @@ sudo chmod 666 /dev/uinput
 ### Server starten
 
 ```bash
-# Standard (Port 5000)
+# Mit virtueller Umgebung (empfohlen)
+source venv/bin/activate
 python app.py
+
+# Oder direkt aus der virtuellen Umgebung
+./venv/bin/python app.py
+
+# Mit benutzerdefinierten Einstellungen
+FLASK_HOST=0.0.0.0 FLASK_PORT=8080 FLASK_DEBUG=True ./venv/bin/python app.py
+
+# Für Produktion mit gunicorn
+pip install gunicorn
+gunicorn -w 4 -b 0.0.0.0:5000 app:app
+```
 
 # Mit benutzerdefinierten Einstellungen
 FLASK_HOST=0.0.0.0 FLASK_PORT=8080 FLASK_DEBUG=True python app.py
