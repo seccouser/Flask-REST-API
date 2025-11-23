@@ -403,6 +403,46 @@ curl http://localhost:5000/process/list
 }
 ```
 
+### 11. System neu starten
+```
+POST /system/reboot
+```
+
+Startet das System neu. Erfordert dass der Flask-Service als root oder mit sudo-Berechtigung läuft.
+
+**Request Body:**
+```json
+{
+  "delay": 0
+}
+```
+
+- `delay` (optional): Verzögerung in Sekunden vor dem Neustart (Standard: 0 = sofort)
+
+**Beispiel (sofortiger Neustart):**
+```bash
+curl -X POST http://localhost:5000/system/reboot \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Beispiel (Neustart mit 60 Sekunden Verzögerung):**
+```bash
+curl -X POST http://localhost:5000/system/reboot \
+  -H "Content-Type: application/json" \
+  -d '{"delay": 60}'
+```
+
+**Response:**
+```json
+{
+  "message": "System reboot initiated",
+  "delay_seconds": 0
+}
+```
+
+**Hinweis:** Die API wird nach dem Neustart-Befehl noch eine Response zurückgeben, aber die Verbindung wird kurz danach unterbrochen wenn das System herunterfährt.
+
 ## Python-Client-Beispiel
 
 ```python

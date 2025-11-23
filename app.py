@@ -471,6 +471,53 @@ def list_processes():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/system/reboot', methods=['POST'])
+def reboot_system():
+    """
+    Reboot the system.
+    
+    JSON body:
+    {
+        "delay": 0 (optional, delay in seconds before reboot, default 0)
+    }
+    
+    Returns:
+        JSON response with status
+    """
+    try:
+        data = request.get_json() or {}
+        delay = data.get('delay', 0)
+        
+        # Validate delay
+        if not isinstance(delay, (int, float)) or delay < 0:
+            return jsonify({'error': 'delay must be a non-negative number'}), 400
+        
+        # Log the reboot request
+        logger.warning(f"System reboot requested with {delay} second delay")
+        
+        # Schedule the reboot
+        import subprocess
+        if delay == 0:
+            subprocess.Popen(['sudo', 'reboot'], 
+                           stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(['sudo', 'shutdown', '-r', f'+{int(delay//60)}'],
+                           stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        
+        return jsonify({
+            'message': 'System reboot initiated',
+            'delay_seconds': delay
+        })
+        
+    except Exception as e:
+        logger.error(f"Reboot error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     # Run the server
     # For production, use a proper WSGI server like gunicorn
