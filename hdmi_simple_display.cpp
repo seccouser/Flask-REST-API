@@ -17,6 +17,15 @@
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sys/stat.h>
+#include <limits.h>
+#include <unistd.h>
+#include <iostream>
 
 #define DEVICE "/dev/video0"
 #define DEFAULT_WIDTH 1920
@@ -158,194 +167,288 @@ void print_usage(const char* prog) {
               << "  -h, --help                 show this help\n";
 }
 
+// --- New helpers: getExecutableDir(), fileExists(), findShaderFile() ---
+static std::string getExecutableDir() {
+    // Try SDL_GetBasePath() first (portable)
+    char* base = SDL_GetBasePath();
+    if (base) {
+        std::string dir(base);
+        SDL_free(base);
+        if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir.push_back('/');
+        return dir;
+    }
+
+    // Fallback: try /proc/self/exe (Linux)
+#if defined(__linux__)
+    char buf[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        std::string path(buf);
+        auto pos = path.find_last_of('/');
+        if (pos != std::string::npos) return path.substr(0, pos + 1);
+    }
+#endif
+
+    // Last resort: current directory
+    return std::string("./");
+}
+
+static bool fileExists(const std::string &path) {
+    struct stat sb;
+    return (stat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode));
+}
+
+static std::string findShaderFile(const std::string &name, std::vector<std::string>* outAttempts = nullptr) {
+    if (name.empty()) return std::string();
+
+    std::vector<std::string> candidates;
+
+    // direct name (cwd)
+    candidates.push_back(name);
+
+    // executable dir + name and some relatives
+    std::string exeDir = getExecutableDir();
+    if (!exeDir.empty()) {
+        candidates.push_back(exeDir + name);
+        candidates.push_back(exeDir + "shaders/" + name);
+        candidates.push_back(exeDir + "../" + name);           // parent of exe dir
+        candidates.push_back(exeDir + "../shaders/" + name);   // parent/shaders
+        candidates.push_back(exeDir + "../../shaders/" + name);// two levels up (useful for build/source layouts)
+        candidates.push_back(exeDir + "assets/" + name);       // possible assets folder
+    }
+
+    // local shaders folder relative to cwd
+    candidates.push_back(std::string("shaders/") + name);
+
+    // common system-wide locations (optional)
+    candidates.push_back(std::string("/usr/local/share/hdmi-in-display/shaders/") + name);
+    candidates.push_back(std::string("/usr/share/hdmi-in-display/shaders/") + name);
+
+    // record attempts if requested
+    if (outAttempts) {
+        outAttempts->clear();
+        outAttempts->reserve(candidates.size());
+    }
+
+    for (const auto &p : candidates) {
+        if (outAttempts) outAttempts->push_back(p);
+        if (fileExists(p)) return p;
+    }
+    return std::string();
+}
+// --- end helpers ---
+
 int main(int argc, char** argv) {
-    static struct option longopts[] = {
-        {"uv-swap", required_argument, nullptr, 0},
-        {"range", required_argument, nullptr, 0},
-        {"matrix", required_argument, nullptr, 0},
-        {"auto-resize-window", no_argument, nullptr, 0},
-        {"cpu-uv-swap", no_argument, nullptr, 0},
-        {"help", no_argument, nullptr, 'h'},
-        {0,0,0,0}
-    };
+  static struct option longopts[] = {
+    {"uv-swap", required_argument, nullptr, 0},
+    {"range", required_argument, nullptr, 0},
+    {"matrix", required_argument, nullptr, 0},
+    {"auto-resize-window", no_argument, nullptr, 0},
+    {"cpu-uv-swap", no_argument, nullptr, 0},
+    {"help", no_argument, nullptr, 'h'},
+    {0,0,0,0}
+  };
 
-    // parse CLI options
-    for (;;) {
-        int idx = 0;
-        int c = getopt_long(argc, argv, "h", longopts, &idx);
-        if (c == -1) break;
-        if (c == 'h') {
-            print_usage(argv[0]);
-            return 0;
-        }
-        if (c == 0) {
-            std::string name = longopts[idx].name;
-            if (name == "uv-swap") {
-                std::string v = optarg ? optarg : "auto";
-                if (v == "auto") opt_uv_swap_override = -1;
-                else if (v == "0") opt_uv_swap_override = 0;
-                else if (v == "1") opt_uv_swap_override = 1;
-                else { std::cerr << "Invalid uv-swap value\n"; print_usage(argv[0]); return 1; }
-            } else if (name == "range") {
-                std::string v = optarg ? optarg : "limited";
-                if (v == "limited") opt_full_range = 0;
-                else if (v == "full") opt_full_range = 1;
-                else { std::cerr << "Invalid range\n"; print_usage(argv[0]); return 1; }
-            } else if (name == "matrix") {
-                std::string v = optarg ? optarg : "709";
-                if (v == "709") opt_use_bt709 = 1;
-                else if (v == "601") opt_use_bt709 = 0;
-                else { std::cerr << "Invalid matrix\n"; print_usage(argv[0]); return 1; }
-            } else if (name == "auto-resize-window") {
-                opt_auto_resize_window = true;
-            } else if (name == "cpu-uv-swap") {
-                opt_cpu_uv_swap = true;
-            }
-        }
+  // parse CLI options
+  for (;;) {
+    int idx = 0;
+    int c = getopt_long(argc, argv, "h", longopts, &idx);
+    if (c == -1) break;
+    if (c == 'h') {
+      print_usage(argv[0]);
+      return 0;
     }
-
-    int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
-    if (fd < 0) {
-        perror("open video0");
-        return 1;
+    if (c == 0) {
+      std::string name = longopts[idx].name;
+      if (name == "uv-swap") {
+        std::string v = optarg ? optarg : "auto";
+        if (v == "auto") opt_uv_swap_override = -1;
+        else if (v == "0") opt_uv_swap_override = 0;
+        else if (v == "1") opt_uv_swap_override = 1;
+        else { std::cerr << "Invalid uv-swap value\n"; print_usage(argv[0]); return 1; }
+      } else if (name == "range") {
+        std::string v = optarg ? optarg : "limited";
+        if (v == "limited") opt_full_range = 0;
+        else if (v == "full") opt_full_range = 1;
+        else { std::cerr << "Invalid range\n"; print_usage(argv[0]); return 1; }
+      } else if (name == "matrix") {
+        std::string v = optarg ? optarg : "709";
+        if (v == "709") opt_use_bt709 = 1;
+        else if (v == "601") opt_use_bt709 = 0;
+        else { std::cerr << "Invalid matrix\n"; print_usage(argv[0]); return 1; }
+      } else if (name == "auto-resize-window") {
+        opt_auto_resize_window = true;
+      } else if (name == "cpu-uv-swap") {
+        opt_cpu_uv_swap = true;
+      }
     }
+  }
 
-    // Initial format detection
-    uint32_t cur_width = DEFAULT_WIDTH, cur_height = DEFAULT_HEIGHT, cur_pixfmt = 0;
-    if (!get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt)) {
-        cur_width = DEFAULT_WIDTH;
-        cur_height = DEFAULT_HEIGHT;
+  int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
+  if (fd < 0) {
+    perror("open video0");
+    return 1;
+  }
+
+  // Initial format detection
+  uint32_t cur_width = DEFAULT_WIDTH, cur_height = DEFAULT_HEIGHT, cur_pixfmt = 0;
+  if (!get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt)) {
+    cur_width = DEFAULT_WIDTH;
+    cur_height = DEFAULT_HEIGHT;
+  }
+
+  // Try to request NV24 initially (may be rejected)
+  v4l2_format fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  fmt.fmt.pix_mp.width = cur_width;
+  fmt.fmt.pix_mp.height = cur_height;
+  fmt.fmt.pix_mp.pixelformat = v4l2_fourcc('N','V','2','4');
+  fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+  fmt.fmt.pix_mp.num_planes = 1;
+  if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+    std::cerr << "VIDIOC_S_FMT: " << strerror(errno) << " (" << errno << ")\n";
+  }
+  // re-read actual
+  get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt);
+
+  // Subscribe to V4L2 source change events (optional; ignore failure)
+  v4l2_event_subscription sub;
+  memset(&sub, 0, sizeof(sub));
+  sub.type = V4L2_EVENT_SOURCE_CHANGE;
+  if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
+    // not fatal
+  }
+
+  // Request buffers (MMAP)
+  v4l2_requestbuffers req;
+  memset(&req, 0, sizeof(req));
+  req.count = BUF_COUNT;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  req.memory = V4L2_MEMORY_MMAP;
+  if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+    perror("VIDIOC_REQBUFS");
+    close(fd);
+    return 1;
+  }
+
+  std::vector<std::vector<PlaneMap>> buffers(req.count);
+
+  for (unsigned i = 0; i < req.count; ++i) {
+    v4l2_buffer buf;
+    v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.index = i;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.m.planes = planes;
+    buf.length = VIDEO_MAX_PLANES;
+
+    if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+      perror("VIDIOC_QUERYBUF");
+      close(fd);
+      return 1;
     }
-
-    // Try to request NV24 initially (may be rejected)
-    v4l2_format fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    fmt.fmt.pix_mp.width = cur_width;
-    fmt.fmt.pix_mp.height = cur_height;
-    fmt.fmt.pix_mp.pixelformat = v4l2_fourcc('N','V','2','4');
-    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix_mp.num_planes = 1;
-    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-        std::cerr << "VIDIOC_S_FMT: " << strerror(errno) << " (" << errno << ")\n";
-    }
-    // re-read actual
-    get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt);
-    std::string pfstr = fourcc_to_str(cur_pixfmt);
-    std::cerr << "Initial pixelformat fourcc: '" << pfstr << "' width=" << cur_width << " height=" << cur_height << "\n";
-
-    // Subscribe to V4L2 source change events (optional; ignore failure)
-    v4l2_event_subscription sub;
-    memset(&sub, 0, sizeof(sub));
-    sub.type = V4L2_EVENT_SOURCE_CHANGE;
-    if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
-        // not fatal
-    } else {
-        std::cerr << "Subscribed to V4L2 source change events\n";
-    }
-
-    // Request buffers (MMAP)
-    v4l2_requestbuffers req;
-    memset(&req, 0, sizeof(req));
-    req.count = BUF_COUNT;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-        perror("VIDIOC_REQBUFS");
+    buffers[i].resize(buf.length);
+    for (unsigned p = 0; p < buf.length; ++p) {
+      buffers[i][p].length = planes[p].length;
+      buffers[i][p].addr = mmap(nullptr, planes[p].length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, planes[p].m.mem_offset);
+      if (buffers[i][p].addr == MAP_FAILED) {
+        perror("mmap plane");
         close(fd);
         return 1;
+      }
     }
-
-    std::vector<std::vector<PlaneMap>> buffers(req.count);
-
-    for (unsigned i = 0; i < req.count; ++i) {
-        v4l2_buffer buf;
-        v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.index = i;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.m.planes = planes;
-        buf.length = VIDEO_MAX_PLANES;
-
-        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            perror("VIDIOC_QUERYBUF");
-            close(fd);
-            return 1;
-        }
-        buffers[i].resize(buf.length);
-        for (unsigned p = 0; p < buf.length; ++p) {
-            buffers[i][p].length = planes[p].length;
-            buffers[i][p].addr = mmap(nullptr, planes[p].length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, planes[p].m.mem_offset);
-            if (buffers[i][p].addr == MAP_FAILED) {
-                perror("mmap plane");
-                close(fd);
-                return 1;
-            }
-        }
-        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF");
-            close(fd);
-            return 1;
-        }
+    if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+      perror("VIDIOC_QBUF");
+      close(fd);
+      return 1;
     }
+  }
 
-    int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (xioctl(fd, VIDIOC_STREAMON, &buf_type) < 0) {
-        perror("VIDIOC_STREAMON");
-        close(fd);
-        return 1;
-    }
+  int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  if (xioctl(fd, VIDIOC_STREAMON, &buf_type) < 0) {
+    perror("VIDIOC_STREAMON");
+    close(fd);
+    return 1;
+  }
 
-    // Init SDL + GL
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
-        close(fd);
-        return 1;
-    }
+  // Init SDL + GL
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
+    close(fd);
+    return 1;
+  }
 
-    SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE,
-        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-        (int)cur_width, (int)cur_height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-    if (!win) {
-        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
-        close(fd);
-        return 1;
-    }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE,
+      SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+      (int)cur_width, (int)cur_height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+  if (!win) {
+    std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
+    close(fd);
+    return 1;
+  }
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-    SDL_GLContext glc = SDL_GL_CreateContext(win);
-    if (!glc) {
-        std::cerr << "SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
-        close(fd);
-        return 1;
-    }
+  SDL_GLContext glc = SDL_GL_CreateContext(win);
+  if (!glc) {
+    std::cerr << "SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
+    close(fd);
+    return 1;
+  }
 
-    if (glewInit() != GLEW_OK) {
-      std::cerr << "GLEW init failed!" << std::endl;
+  if (glewInit() != GLEW_OK) {
+    std::cerr << "GLEW init failed!" << std::endl;
+    close(fd);
+    return 1;
+  }
+
+  // Query maximum supported texture size (used by tiled uploads)
+  GLint gl_max_tex = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_max_tex);
+
+  // Start in fullscreen (desktop) immediately
+  if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
+    // ignore failure to set fullscreen
+  }
+  int win_w = 0, win_h = 0;
+  SDL_GetWindowSize(win, &win_w, &win_h);
+  glViewport(0, 0, win_w, win_h);
+
+  // ----- Shaders and geometry -----
+  // Resolve shader paths robustly so launching from other working directories still finds them
+  {
+    std::vector<std::string> attempts;
+    std::string vertPath = findShaderFile("shader.vert.glsl", &attempts);
+    if (vertPath.empty()) {
+      std::cerr << "Vertex shader not found. Tried the following paths:\n";
+      for (const auto &p : attempts) std::cerr << "  " << p << "\n";
       close(fd);
       return 1;
     }
 
-    // Query GL_MAX_TEXTURE_SIZE
-    GLint gl_max_tex = 0;
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_max_tex);
-    std::cerr << "GL_MAX_TEXTURE_SIZE = " << gl_max_tex << "\n";
+    attempts.clear();
+    std::string fragPath = findShaderFile("shader.frag.glsl", &attempts);
+    if (fragPath.empty()) {
+      std::cerr << "Fragment shader not found. Tried the following paths:\n";
+      for (const auto &p : attempts) std::cerr << "  " << p << "\n";
+      close(fd);
+      return 1;
+    }
 
-    glViewport(0, 0, (int)cur_width, (int)cur_height);
+    GLuint program = createShaderProgram(vertPath.c_str(), fragPath.c_str());
 
-    // ----- Shaders and geometry -----
-    GLuint program = createShaderProgram("shader.vert.glsl", "shader.frag.glsl");
     glUseProgram(program);
 
     float verts[] = {
-        -1, -1,     0, 0,
-         1, -1,     1, 0,
-        -1,  1,     0, 1,
-         1,  1,     1, 1,
-    };
+      -1, -1,     0, 0,
+       1, -1,     1, 0,
+      -1,  1,     0, 1,
+       1,  1,     1, 1,
+  };
     GLuint vbo = 0, vao = 0;
     glGenBuffers(1, &vbo);
     glGenVertexArrays(1, &vao);
@@ -397,26 +500,21 @@ int main(int argc, char** argv) {
     // Stable defaults for typical HDMI capture
     int uv_swap = 0;     // default; may be auto-set below
     if (opt_uv_swap_override >= 0) {
-        uv_swap = opt_uv_swap_override;
-        std::cerr << "uv_swap overridden by CLI -> " << uv_swap << "\n";
+      uv_swap = opt_uv_swap_override;
     } else {
-        // auto detect NV12/NV21
-        if (cur_pixfmt == V4L2_PIX_FMT_NV21) {
-            uv_swap = 1;
-            std::cerr << "Auto-detected NV21 -> setting uv_swap=1\n";
-        } else if (cur_pixfmt == V4L2_PIX_FMT_NV12) {
-            uv_swap = 0;
-            std::cerr << "Auto-detected NV12 -> setting uv_swap=0\n";
-        } else {
-            uv_swap = 0; // conservative default
-            std::cerr << "Unknown initial pixelformat (" << fourcc_to_str(cur_pixfmt) << "), default uv_swap=" << uv_swap << "\n";
-        }
+      // auto detect NV12/NV21
+      if (cur_pixfmt == V4L2_PIX_FMT_NV21) {
+        uv_swap = 1;
+      } else if (cur_pixfmt == V4L2_PIX_FMT_NV12) {
+        uv_swap = 0;
+      } else {
+        uv_swap = 0; // conservative default
+      }
     }
 
     // If CPU swap requested, we'll perform swap on upload and ensure shader uses uv_swap=0
     if (opt_cpu_uv_swap) {
-        uv_swap = 0;
-        std::cerr << "CPU UV swap enabled -> shader uv_swap forced to 0\n";
+      uv_swap = 0;
     }
 
     if (loc_uv_swap >= 0) glUniform1i(loc_uv_swap, uv_swap);
@@ -440,273 +538,250 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> tmpUVbuf; // for CPU swap of UV when needed
     std::vector<unsigned char> tmpFallback; // fallback for packed format
 
+    // Track fullscreen state for 'F' toggle
+    bool is_fullscreen = true;
+
     while (running) {
-        // Use poll to wait for either frame data (POLLIN) or event (POLLPRI)
-        int ret = poll(&pfd, 1, 2000); // 2s timeout
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            break;
-        } else if (ret == 0) {
-            // timeout, do periodic checks below
-        } else {
-            if (pfd.revents & POLLPRI) {
-                v4l2_event ev;
-                while (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
-                    if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
-                        uint32_t new_w=0, new_h=0, new_pf=0;
-                        if (get_v4l2_format(fd, new_w, new_h, new_pf)) {
-                            if (new_w != cur_width || new_h != cur_height || new_pf != cur_pixfmt) {
-                                std::string oldpf = fourcc_to_str(cur_pixfmt);
-                                std::string newpf = fourcc_to_str(new_pf);
-                                std::cerr << "V4L2 event: format changed: " << cur_width << "x" << cur_height
-                                          << " (" << oldpf << ") -> " << new_w << "x" << new_h
-                                          << " (" << newpf << ")" << std::endl;
-                                cur_width = new_w;
-                                cur_height = new_h;
-                                cur_pixfmt = new_pf;
-                                uv_w = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_width/2) : (int)cur_width;
-                                uv_h = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_height/2) : (int)cur_height;
-                                reallocate_textures(texY, texUV, (int)cur_width, (int)cur_height, uv_w, uv_h);
-                                if (opt_auto_resize_window) SDL_SetWindowSize(win, (int)cur_width, (int)cur_height);
-                                if (opt_uv_swap_override < 0 && !opt_cpu_uv_swap) {
-                                    int old_uv = uv_swap;
-                                    if (cur_pixfmt == V4L2_PIX_FMT_NV21) uv_swap = 1;
-                                    else if (cur_pixfmt == V4L2_PIX_FMT_NV12) uv_swap = 0;
-                                    if (uv_swap != old_uv && loc_uv_swap >= 0) {
-                                        glUseProgram(program);
-                                        glUniform1i(loc_uv_swap, uv_swap);
-                                        std::cerr << "Auto-adjusted uv_swap -> " << uv_swap << " (based on " << newpf << ")\n";
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Periodic format check
-        if ((frame_count % CHECK_FMT_INTERVAL) == 0) {
-            uint32_t new_w=0, new_h=0, new_pf=0;
-            if (get_v4l2_format(fd, new_w, new_h, new_pf)) {
+      // Use poll to wait for either frame data (POLLIN) or event (POLLPRI)
+      int ret = poll(&pfd, 1, 2000); // 2s timeout
+      if (ret < 0) {
+        if (errno == EINTR) continue;
+        perror("poll");
+        break;
+      } else if (ret == 0) {
+        // timeout, do periodic checks below
+      } else {
+        if (pfd.revents & POLLPRI) {
+          v4l2_event ev;
+          while (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+              uint32_t new_w=0, new_h=0, new_pf=0;
+              if (get_v4l2_format(fd, new_w, new_h, new_pf)) {
                 if (new_w != cur_width || new_h != cur_height || new_pf != cur_pixfmt) {
-                    std::string oldpf = fourcc_to_str(cur_pixfmt);
-                    std::string newpf = fourcc_to_str(new_pf);
-                    std::cerr << "Periodic check: format changed: " << cur_width << "x" << cur_height
-                              << " (" << oldpf << ") -> " << new_w << "x" << new_h
-                              << " (" << newpf << ")" << std::endl;
-                    cur_width = new_w;
-                    cur_height = new_h;
-                    cur_pixfmt = new_pf;
-                    uv_w = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_width/2) : (int)cur_width;
-                    uv_h = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_height/2) : (int)cur_height;
-                    reallocate_textures(texY, texUV, (int)cur_width, (int)cur_height, uv_w, uv_h);
-                    if (opt_auto_resize_window) SDL_SetWindowSize(win, (int)cur_width, (int)cur_height);
-                    if (opt_uv_swap_override < 0 && !opt_cpu_uv_swap) {
-                        int old_uv = uv_swap;
-                        if (cur_pixfmt == V4L2_PIX_FMT_NV21) uv_swap = 1;
-                        else if (cur_pixfmt == V4L2_PIX_FMT_NV12) uv_swap = 0;
-                        if (uv_swap != old_uv && loc_uv_swap >= 0) {
-                            glUseProgram(program);
-                            glUniform1i(loc_uv_swap, uv_swap);
-                            std::cerr << "Auto-adjusted uv_swap -> " << uv_swap << " (based on " << fourcc_to_str(cur_pixfmt) << ")\n";
-                        }
+                  cur_width = new_w;
+                  cur_height = new_h;
+                  cur_pixfmt = new_pf;
+                  uv_w = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_width/2) : (int)cur_width;
+                  uv_h = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_height/2) : (int)cur_height;
+                  reallocate_textures(texY, texUV, (int)cur_width, (int)cur_height, uv_w, uv_h);
+                  if (opt_auto_resize_window) SDL_SetWindowSize(win, (int)cur_width, (int)cur_height);
+                  if (opt_uv_swap_override < 0 && !opt_cpu_uv_swap) {
+                    int old_uv = uv_swap;
+                    if (cur_pixfmt == V4L2_PIX_FMT_NV21) uv_swap = 1;
+                    else if (cur_pixfmt == V4L2_PIX_FMT_NV12) uv_swap = 0;
+                    if (uv_swap != old_uv && loc_uv_swap >= 0) {
+                      glUseProgram(program);
+                      glUniform1i(loc_uv_swap, uv_swap);
                     }
+                  }
                 }
+              }
             }
+          }
         }
+      }
 
-        // Now try to dequeue a video buffer
-        v4l2_buffer buf;
-        v4l2_plane planes[VIDEO_MAX_PLANES];
-        memset(&buf, 0, sizeof(buf));
-        memset(planes, 0, sizeof(planes));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.m.planes = planes;
-        buf.length = VIDEO_MAX_PLANES;
-
-        if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ++frame_count;
-                continue;
-            } else {
-                perror("VIDIOC_DQBUF");
-                break;
+      // Periodic format check
+      if ((frame_count % CHECK_FMT_INTERVAL) == 0) {
+        uint32_t new_w=0, new_h=0, new_pf=0;
+        if (get_v4l2_format(fd, new_w, new_h, new_pf)) {
+          if (new_w != cur_width || new_h != cur_height || new_pf != cur_pixfmt) {
+            cur_width = new_w;
+            cur_height = new_h;
+            cur_pixfmt = new_pf;
+            uv_w = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_width/2) : (int)cur_width;
+            uv_h = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_height/2) : (int)cur_height;
+            reallocate_textures(texY, texUV, (int)cur_width, (int)cur_height, uv_w, uv_h);
+            if (opt_auto_resize_window) SDL_SetWindowSize(win, (int)cur_width, (int)cur_height);
+            if (opt_uv_swap_override < 0 && !opt_cpu_uv_swap) {
+              int old_uv = uv_swap;
+              if (cur_pixfmt == V4L2_PIX_FMT_NV21) uv_swap = 1;
+              else if (cur_pixfmt == V4L2_PIX_FMT_NV12) uv_swap = 0;
+              if (uv_swap != old_uv && loc_uv_swap >= 0) {
+                glUseProgram(program);
+                glUniform1i(loc_uv_swap, uv_swap);
+              }
             }
+          }
         }
+      }
 
-        unsigned char* base = (unsigned char*)buffers[buf.index][0].addr;
-        size_t bytesused0 = planes[0].bytesused;
+      // Now try to dequeue a video buffer
+      v4l2_buffer buf;
+      v4l2_plane planes[VIDEO_MAX_PLANES];
+      memset(&buf, 0, sizeof(buf));
+      memset(planes, 0, sizeof(planes));
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.m.planes = planes;
+      buf.length = VIDEO_MAX_PLANES;
 
-        // sizes
-        size_t Y_len = (size_t)cur_width * (size_t)cur_height;
-        size_t UV_len = 0;
-        bool isNV12_NV21 = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21);
-        if (isNV12_NV21) UV_len = (size_t)cur_width * ((size_t)cur_height / 2);
-        else UV_len = (size_t)cur_width * (size_t)cur_height * 2;
-        size_t total_expected = Y_len + UV_len;
-
-        unsigned char* ybase = nullptr;
-        unsigned char* uvbase = nullptr;
-
-        if (buf.length >= 2 && buffers[buf.index].size() >= 2) {
-            ybase = (unsigned char*)buffers[buf.index][0].addr;
-            uvbase = (unsigned char*)buffers[buf.index][1].addr;
-        } else if (bytesused0 >= total_expected) {
-            ybase = base;
-            uvbase = base + Y_len;
+      if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          ++frame_count;
+          continue;
         } else {
-            ybase = base;
-            uvbase = nullptr;
+          perror("VIDIOC_DQBUF");
+          break;
         }
+      }
 
-        // Upload Y
-        if (ybase) {
-            if ((int)cur_width <= gl_max_tex && (int)cur_height <= gl_max_tex) {
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, texY);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, ybase);
-            } else {
-                upload_texture_tiled(GL_RED, texY, (int)cur_width, (int)cur_height, ybase, gl_max_tex, 1);
-            }
-        }
+      unsigned char* base = (unsigned char*)buffers[buf.index][0].addr;
+      size_t bytesused0 = planes[0].bytesused;
 
-        // Upload UV
-        if (uvbase) {
-            int upload_w = isNV12_NV21 ? (int)(cur_width/2) : (int)cur_width;
-            int upload_h = isNV12_NV21 ? (int)(cur_height/2) : (int)cur_height;
+      // sizes
+      size_t Y_len = (size_t)cur_width * (size_t)cur_height;
+      size_t UV_len = 0;
+      bool isNV12_NV21 = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21);
+      if (isNV12_NV21) UV_len = (size_t)cur_width * ((size_t)cur_height / 2);
+      else UV_len = (size_t)cur_width * (size_t)cur_height * 2;
+      size_t total_expected = Y_len + UV_len;
 
-            if (opt_cpu_uv_swap && cur_pixfmt == V4L2_PIX_FMT_NV21) {
-                size_t need = (size_t)upload_w * (size_t)upload_h * 2;
-                if (tmpUVbuf.size() < need) tmpUVbuf.resize(need);
-                unsigned char* dst = tmpUVbuf.data();
+      unsigned char* ybase = nullptr;
+      unsigned char* uvbase = nullptr;
 
-                if (isNV12_NV21) {
-                    for (int y = 0; y < upload_h; ++y) {
-                        const unsigned char* srcRow = uvbase + (size_t)y * (size_t)cur_width;
-                        unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
-                        for (int x = 0; x < upload_w; ++x) {
-                            unsigned char v = srcRow[x*2 + 0];
-                            unsigned char u = srcRow[x*2 + 1];
-                            dstRow[x*2 + 0] = u;
-                            dstRow[x*2 + 1] = v;
-                        }
-                    }
-                } else {
-                    for (int y = 0; y < upload_h; ++y) {
-                        const unsigned char* srcRow = uvbase + (size_t)y * (size_t)upload_w * 2;
-                        unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
-                        for (int x = 0; x < upload_w; ++x) {
-                            unsigned char v = srcRow[x*2 + 0];
-                            unsigned char u = srcRow[x*2 + 1];
-                            dstRow[x*2 + 0] = u;
-                            dstRow[x*2 + 1] = v;
-                        }
-                    }
-                }
+      if (buf.length >= 2 && buffers[buf.index].size() >= 2) {
+        ybase = (unsigned char*)buffers[buf.index][0].addr;
+        uvbase = (unsigned char*)buffers[buf.index][1].addr;
+      } else if (bytesused0 >= total_expected) {
+        ybase = base;
+        uvbase = base + Y_len;
+      } else {
+        ybase = base;
+        uvbase = nullptr;
+      }
 
-                if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
-                    glActiveTexture(GL_TEXTURE1);
-                    glBindTexture(GL_TEXTURE_2D, texUV);
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, tmpUVbuf.data());
-                } else {
-                    upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, tmpUVbuf.data(), gl_max_tex, 2);
-                }
-            } else {
-                if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
-                    glActiveTexture(GL_TEXTURE1);
-                    glBindTexture(GL_TEXTURE_2D, texUV);
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, uvbase);
-                } else {
-                    upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, uvbase, gl_max_tex, 2);
-                }
-            }
+      // Upload Y
+      if (ybase) {
+        if ((int)cur_width <= gl_max_tex && (int)cur_height <= gl_max_tex) {
+          glActiveTexture(GL_TEXTURE0);
+          glBindTexture(GL_TEXTURE_2D, texY);
+          glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+          glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, ybase);
         } else {
-            // fallback packed interleaved (Y,U,V per pixel)
-            size_t need = Y_len + (size_t)cur_width * (size_t)cur_height * 2;
-            if (tmpFallback.size() < need) tmpFallback.resize(need);
-            unsigned char* dst = tmpFallback.data();
-            unsigned char* src = base;
-            for (size_t i = 0, j = 0; i < (size_t)cur_width * (size_t)cur_height; ++i) {
-                dst[j++] = src[i*3 + 0];
-                dst[j++] = src[i*3 + 1];
-                dst[j++] = src[i*3 + 2];
+          upload_texture_tiled(GL_RED, texY, (int)cur_width, (int)cur_height, ybase, gl_max_tex, 1);
+        }
+      }
+
+      // Upload UV
+      if (uvbase) {
+        int upload_w = isNV12_NV21 ? (int)(cur_width/2) : (int)cur_width;
+        int upload_h = isNV12_NV21 ? (int)(cur_height/2) : (int)cur_height;
+
+        if (opt_cpu_uv_swap && cur_pixfmt == V4L2_PIX_FMT_NV21) {
+          size_t need = (size_t)upload_w * (size_t)upload_h * 2;
+          if (tmpUVbuf.size() < need) tmpUVbuf.resize(need);
+          unsigned char* dst = tmpUVbuf.data();
+
+          if (isNV12_NV21) {
+            for (int y = 0; y < upload_h; ++y) {
+              const unsigned char* srcRow = uvbase + (size_t)y * (size_t)cur_width;
+              unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
+              for (int x = 0; x < upload_w; ++x) {
+                unsigned char v = srcRow[x*2 + 0];
+                unsigned char u = srcRow[x*2 + 1];
+                dstRow[x*2 + 0] = u;
+                dstRow[x*2 + 1] = v;
+              }
             }
-            unsigned char* tmpY = dst;
-            unsigned char* tmpUV = dst + Y_len;
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texY);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, tmpY);
+          } else {
+            for (int y = 0; y < upload_h; ++y) {
+              const unsigned char* srcRow = uvbase + (size_t)y * (size_t)upload_w * 2;
+              unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
+              for (int x = 0; x < upload_w; ++x) {
+                unsigned char v = srcRow[x*2 + 0];
+                unsigned char u = srcRow[x*2 + 1];
+                dstRow[x*2 + 0] = u;
+                dstRow[x*2 + 1] = v;
+              }
+            }
+          }
+
+          if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, texUV);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RG, GL_UNSIGNED_BYTE, tmpUV);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, tmpUVbuf.data());
+          } else {
+            upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, tmpUVbuf.data(), gl_max_tex, 2);
+          }
+        } else {
+          if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, texUV);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, uvbase);
+          } else {
+            upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, uvbase, gl_max_tex, 2);
+          }
         }
-
-        // Draw
-        glClear(GL_COLOR_BUFFER_BIT);
-        glUseProgram(program);
-
-        if (!opt_cpu_uv_swap && loc_uv_swap >= 0) glUniform1i(loc_uv_swap, uv_swap);
-        if (loc_use_bt709 >= 0) glUniform1i(loc_use_bt709, opt_use_bt709);
-        if (loc_full_range >= 0) glUniform1i(loc_full_range, opt_full_range);
-
+      } else {
+        // fallback packed interleaved (Y,U,V per pixel)
+        size_t need = Y_len + (size_t)cur_width * (size_t)cur_height * 2;
+        if (tmpFallback.size() < need) tmpFallback.resize(need);
+        unsigned char* dst = tmpFallback.data();
+        unsigned char* src = base;
+        for (size_t i = 0, j = 0; i < (size_t)cur_width * (size_t)cur_height; ++i) {
+          dst[j++] = src[i*3 + 0];
+          dst[j++] = src[i*3 + 1];
+          dst[j++] = src[i*3 + 2];
+        }
+        unsigned char* tmpY = dst;
+        unsigned char* tmpUV = dst + Y_len;
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texY);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, tmpY);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, texUV);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RG, GL_UNSIGNED_BYTE, tmpUV);
+      }
 
-        glBindVertexArray(vao);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+      // Draw
+      glClear(GL_COLOR_BUFFER_BIT);
+      glUseProgram(program);
 
-        SDL_GL_SwapWindow(win);
+      if (!opt_cpu_uv_swap && loc_uv_swap >= 0) glUniform1i(loc_uv_swap, uv_swap);
+      if (loc_use_bt709 >= 0) glUniform1i(loc_use_bt709, opt_use_bt709);
+      if (loc_full_range >= 0) glUniform1i(loc_full_range, opt_full_range);
 
-        // Requeue buffer
-        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF (requeue)");
-            break;
-        }
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, texY);
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, texUV);
 
-        // Events: minimal toggles
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) running = false;
-            else if (e.type == SDL_KEYDOWN) {
-                SDL_Keycode k = e.key.keysym.sym;
-                if (k == SDLK_ESCAPE) running = false;
-                else if (k == SDLK_u && !opt_cpu_uv_swap) {
-                    uv_swap = !uv_swap;
-                    glUseProgram(program);
-                    if (loc_uv_swap >= 0) glUniform1i(loc_uv_swap, uv_swap);
-                    std::cerr << "Toggled uv_swap -> " << uv_swap << std::endl;
-                } else if (k == SDLK_m) {
-                    opt_use_bt709 = !opt_use_bt709;
-                    glUseProgram(program);
-                    if (loc_use_bt709 >= 0) glUniform1i(loc_use_bt709, opt_use_bt709);
-                    std::cerr << "Toggled use_bt709 -> " << opt_use_bt709 << std::endl;
-                } else if (k == SDLK_r) {
-                    opt_full_range = !opt_full_range;
-                    glUseProgram(program);
-                    if (loc_full_range >= 0) glUniform1i(loc_full_range, opt_full_range);
-                    std::cerr << "Toggled full_range -> " << opt_full_range << std::endl;
-                } else if (k == SDLK_v) {
-                    if (loc_view_mode >= 0) {
-                        int vm = 0;
-                        glGetUniformiv(program, loc_view_mode, &vm); // read current
-                        vm = (vm + 1) % 4;
-                        glUseProgram(program);
-                        glUniform1i(loc_view_mode, vm);
-                        std::cerr << "Toggled view_mode -> " << vm << std::endl;
-                    }
-                }
+      glBindVertexArray(vao);
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+      SDL_GL_SwapWindow(win);
+
+      // Requeue buffer
+      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("VIDIOC_QBUF (requeue)");
+        break;
+      }
+
+      // Events: minimal toggles
+      SDL_Event e;
+      while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) running = false;
+        else if (e.type == SDL_KEYDOWN) {
+          SDL_Keycode k = e.key.keysym.sym;
+          if (k == SDLK_ESCAPE) running = false;
+          else if (k == SDLK_f) {
+            // Toggle fullscreen desktop mode
+            Uint32 flags = SDL_GetWindowFlags(win);
+            if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
+              SDL_SetWindowFullscreen(win, 0);
+              is_fullscreen = false;
+            } else {
+              SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+              is_fullscreen = true;
             }
+          }
         }
+      }
 
-        ++frame_count;
+      ++frame_count;
     }
 
     // Cleanup
@@ -720,9 +795,10 @@ int main(int argc, char** argv) {
     SDL_Quit();
 
     for (auto& bufv : buffers)
-        for (auto& pm : bufv)
-            if (pm.addr && pm.length) munmap(pm.addr, pm.length);
+      for (auto& pm : bufv)
+        if (pm.addr && pm.length) munmap(pm.addr, pm.length);
 
     close(fd);
     return 0;
+  }
 }
