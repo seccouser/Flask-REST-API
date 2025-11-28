@@ -1,5 +1,7 @@
 // hdmi_simple_display.cpp
 // Production: auto-resize, tiled uploads, V4L2 events, CLI, CPU UV-swap option, improved tiled upload reuse
+// Includes: runtime control_ini, modul*.txt offsets, gap handling, and async PNG screenshot via stb_image_write
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -22,6 +24,13 @@
 #include <sstream>
 #include <array>
 #include <cctype>
+#include <thread>
+#include <memory>
+#include <atomic>
+#include <cmath>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #define DEVICE "/dev/video0"
 #define DEFAULT_WIDTH 1920
@@ -34,6 +43,8 @@ static bool opt_cpu_uv_swap = false; // if true, do CPU swap at upload
 static int opt_uv_swap_override = -1; // -1 = auto, 0/1 override
 static int opt_full_range = 0; // 0 limited, 1 full
 static int opt_use_bt709 = 1; // 1 = BT.709, 0 = BT.601
+
+// ----------------- helper functions (loadShaderSource, xioctl, compileShader, createShaderProgram, etc.)
 
 std::string loadShaderSource(const char* filename) {
     std::ifstream file(filename);
@@ -94,7 +105,6 @@ std::string fourcc_to_str(uint32_t f) {
     return std::string(s);
 }
 
-// Query current V4L2 format (width/height/pixelformat)
 bool get_v4l2_format(int fd, uint32_t &width, uint32_t &height, uint32_t &pixelformat) {
     v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
@@ -108,7 +118,6 @@ bool get_v4l2_format(int fd, uint32_t &width, uint32_t &height, uint32_t &pixelf
     return true;
 }
 
-// Reallocate GL textures for new width/height and uv size (must be called in GL context)
 void reallocate_textures(GLuint texY, GLuint texUV, int newW, int newH, int uvW, int uvH) {
     glBindTexture(GL_TEXTURE_2D, texY);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -119,14 +128,12 @@ void reallocate_textures(GLuint texY, GLuint texUV, int newW, int newH, int uvW,
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uvW, uvH, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
 }
 
-// Improved tiled upload: reuse a single tile buffer to avoid repeated allocations
 void upload_texture_tiled(GLenum format, GLuint tex, int srcW, int srcH,
                           const unsigned char* src, int maxTexSize, int pixelSizePerTexel) {
-    // tile dims
     int tileW = std::min(srcW, maxTexSize);
     int tileH = std::min(srcH, maxTexSize);
 
-    static std::vector<unsigned char> tileBuf; // reused across calls
+    static std::vector<unsigned char> tileBuf;
 
     for (int y = 0; y < srcH; y += tileH) {
         int h = std::min(tileH, srcH - y);
@@ -138,7 +145,6 @@ void upload_texture_tiled(GLenum format, GLuint tex, int srcW, int srcH,
         } else {
             for (int x = 0; x < srcW; x += tileW) {
                 int w = std::min(tileW, srcW - x);
-                // prepare contiguous tile buffer
                 tileBuf.resize((size_t)h * (size_t)w * pixelSizePerTexel);
                 for (int row = 0; row < h; ++row) {
                     const unsigned char* srcRow = src + (size_t)(y + row) * (size_t)srcW * pixelSizePerTexel + (size_t)x * pixelSizePerTexel;
@@ -163,7 +169,7 @@ void print_usage(const char* prog) {
               << "  -h, --help                 show this help\n";
 }
 
-// --- Helpers: getExecutableDir(), fileExists(), findShaderFile() ---
+// Helpers for file paths and offsets
 static std::string getExecutableDir() {
     char* base = SDL_GetBasePath();
     if (base) {
@@ -218,7 +224,6 @@ static std::string findShaderFile(const std::string &name, std::vector<std::stri
     return std::string();
 }
 
-// --- Helpers for loading module offset files (robust, with logging) ---
 static std::string joinPath(const std::string &dir, const std::string &name) {
     if (dir.empty()) return name;
     if (dir.back() == '/' || dir.back() == '\\') return dir + name;
@@ -237,8 +242,6 @@ static bool parseXYLine(const std::string &line, int &x, int &y) {
     return true;
 }
 
-// names: {"modul1.txt","modul2.txt","modul3.txt"}
-// out: vector<GLint> of size 150*2 (x0,y0,x1,y1,...)
 static bool loadOffsetsFromModuleFiles(const std::array<std::string,3> &names, std::vector<GLint> &out) {
     out.assign(150 * 2, 0);
     size_t fillIndex = 0;
@@ -279,9 +282,8 @@ static bool loadOffsetsFromModuleFiles(const std::array<std::string,3> &names, s
     return true;
 }
 
-// --- new struct for control parameters ---
+// ControlParams + parser
 struct ControlParams {
-    // defaults match previous hard-coded shader constants
     float fullInputW = 3840.0f;
     float fullInputH = 2160.0f;
     int segmentsX = 3;
@@ -297,14 +299,11 @@ struct ControlParams {
     int numTilesPerRow = 10;
     int numTilesPerCol = 15;
 
-    int inputTilesTopToBottom = 1; // default: source tiles top->bottom
+    int inputTilesTopToBottom = 1;
 
     int moduleSerials[3] = {0,0,0};
 };
 
-// --- simple parser for control_ini.txt ---
-// Format: key = value
-// vector values comma separated, comments with # ignored
 static bool loadControlIni(const std::string &path, ControlParams &out) {
     std::ifstream f;
     std::string exeDir = getExecutableDir();
@@ -324,7 +323,6 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
             if (eq == std::string::npos) continue;
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq+1);
-            // trim
             auto trim = [](std::string &str) {
                 size_t a = str.find_first_not_of(" \t\r\n");
                 if (a == std::string::npos) { str.clear(); return; }
@@ -335,7 +333,6 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
             if (key.empty() || val.empty()) continue;
 
             if (key == "fullInputSize") {
-                // "W,H"
                 int a=0,b=0;
                 if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.fullInputW = (float)a; out.fullInputH = (float)b; }
             } else if (key == "segments") {
@@ -358,7 +355,6 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
             } else if (key == "inputTilesTopToBottom") {
                 out.inputTilesTopToBottom = atoi(val.c_str()) ? 1 : 0;
             } else if (key == "moduleSerials") {
-                // comma separated three ints
                 int a=0,b=0,c2=0;
                 if (sscanf(val.c_str(), "%d,%d,%d", &a, &b, &c2) >= 1) {
                     out.moduleSerials[0] = a; out.moduleSerials[1] = b; out.moduleSerials[2] = c2;
@@ -381,179 +377,365 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
     return true;
 }
 
-int main(int argc, char** argv) {
-  static struct option longopts[] = {
-    {"uv-swap", required_argument, nullptr, 0},
-    {"range", required_argument, nullptr, 0},
-    {"matrix", required_argument, nullptr, 0},
-    {"auto-resize-window", no_argument, nullptr, 0},
-    {"cpu-uv-swap", no_argument, nullptr, 0},
-    {"help", no_argument, nullptr, 'h'},
-    {0,0,0,0}
-  };
+// async: generic frame -> PNG writer that supports NV12/NV21 and common packed formats
+static void async_save_frame_to_png(std::vector<unsigned char> ybuf,
+                                    std::vector<unsigned char> uvbuf,
+                                    std::vector<unsigned char> packed,
+                                    size_t packedSize,
+                                    int width, int height,
+                                    uint32_t pixfmt, // V4L2 format
+                                    int uv_swap_flag, // 0 NV12(U,V) / 1 NV21(V,U)
+                                    int use_bt709_flag, int full_range_flag,
+                                    std::string filename_png)
+{
+    std::string fourcc = fourcc_to_str(pixfmt);
+    std::cerr << "[screenshot-worker] start filename=" << filename_png
+              << " fmt=" << pixfmt << " (" << fourcc << ")"
+              << " size=" << width << "x" << height
+              << " y=" << ybuf.size() << " uv=" << uvbuf.size()
+              << " packed=" << packedSize
+              << " uv_swap=" << uv_swap_flag << " bt709=" << use_bt709_flag << " full=" << full_range_flag << "\n";
 
-  for (;;) {
-    int idx = 0;
-    int c = getopt_long(argc, argv, "h", longopts, &idx);
-    if (c == -1) break;
-    if (c == 'h') {
-      print_usage(argv[0]);
-      return 0;
+    const int comp = 3;
+    std::vector<unsigned char> rgb;
+    try {
+        rgb.resize((size_t)width * (size_t)height * comp);
+    } catch (...) {
+        std::cerr << "[screenshot-worker] allocation failed\n";
+        return;
     }
-    if (c == 0) {
-      std::string name = longopts[idx].name;
-      if (name == "uv-swap") {
-        std::string v = optarg ? optarg : "auto";
-        if (v == "auto") opt_uv_swap_override = -1;
-        else if (v == "0") opt_uv_swap_override = 0;
-        else if (v == "1") opt_uv_swap_override = 1;
-        else { std::cerr << "Invalid uv-swap value\n"; print_usage(argv[0]); return 1; }
-      } else if (name == "range") {
-        std::string v = optarg ? optarg : "limited";
-        if (v == "limited") opt_full_range = 0;
-        else if (v == "full") opt_full_range = 1;
-        else { std::cerr << "Invalid range\n"; print_usage(argv[0]); return 1; }
-      } else if (name == "matrix") {
-        std::string v = optarg ? optarg : "709";
-        if (v == "709") opt_use_bt709 = 1;
-        else if (v == "601") opt_use_bt709 = 0;
-        else { std::cerr << "Invalid matrix\n"; print_usage(argv[0]); return 1; }
-      } else if (name == "auto-resize-window") {
-        opt_auto_resize_window = true;
-      } else if (name == "cpu-uv-swap") {
-        opt_cpu_uv_swap = true;
+
+    // Heuristic lengths
+    size_t ylen = (size_t)width * (size_t)height;
+    size_t uvlen = (size_t)width * ((size_t)height / 2);
+
+    bool handled = false;
+
+    // Case A: NV12/NV21 explicit, OR heuristic: packed == Y+UV -> treat packed as NV12 contiguous (Y then UV)
+    if (pixfmt == V4L2_PIX_FMT_NV12 || pixfmt == V4L2_PIX_FMT_NV21 ||
+        (ybuf.empty() && uvbuf.empty() && packedSize == (ylen + uvlen))) {
+
+        // If we only have packed blob with correct size, split into y/uv
+        if (ybuf.empty() && uvbuf.empty() && packedSize == (ylen + uvlen)) {
+            ybuf.assign(packed.begin(), packed.begin() + ylen);
+            uvbuf.assign(packed.begin() + ylen, packed.begin() + ylen + uvlen);
+            // For logging clarity, treat as NV12 unless uv_swap_flag indicates NV21
+            std::cerr << "[screenshot-worker] heuristic: split packed->Y/UV for NV12-like data\n";
+        }
+
+        // Decode NV12/NV21 using uv_swap_flag (0 = NV12 U,V ; 1 = NV21 V,U)
+        for (int yy = 0; yy < height; ++yy) {
+            int uv_row = yy / 2;
+            for (int xx = 0; xx < width; ++xx) {
+                int yi = yy * width + xx;
+                int uv_col = (xx / 2);
+                size_t uvIndex = (size_t)uv_row * (size_t)width + (size_t)uv_col * 2;
+                unsigned char Yc = (yi < (int)ybuf.size()) ? ybuf[yi] : 0;
+                unsigned char Uc = (uvIndex + 1 < uvbuf.size() && uvbuf.size()>0) ? uvbuf[uvIndex + (uv_swap_flag ? 1 : 0)] : 128;
+                unsigned char Vc = (uvIndex + 1 < uvbuf.size() && uvbuf.size()>0) ? uvbuf[uvIndex + (uv_swap_flag ? 0 : 1)] : 128;
+
+                float Yf = (float)Yc;
+                float Uf = (float)Uc - 128.0f;
+                float Vf = (float)Vc - 128.0f;
+                float rf, gf, bf;
+                if (full_range_flag == 1) {
+                    if (use_bt709_flag == 1) {
+                        rf = Yf + 1.792741f * Vf;
+                        gf = Yf - 0.213249f * Uf - 0.532909f * Vf;
+                        bf = Yf + 2.112402f * Uf;
+                    } else {
+                        rf = Yf + 1.596027f * Vf;
+                        gf = Yf - 0.391762f * Uf - 0.812968f * Vf;
+                        bf = Yf + 2.017232f * Uf;
+                    }
+                } else {
+                    float y_lin = 1.164383f * (Yf - 16.0f);
+                    if (use_bt709_flag == 1) {
+                        rf = y_lin + 1.792741f * Vf;
+                        gf = y_lin - 0.213249f * Uf - 0.532909f * Vf;
+                        bf = y_lin + 2.112402f * Uf;
+                    } else {
+                        rf = y_lin + 1.596027f * Vf;
+                        gf = y_lin - 0.391762f * Uf - 0.812968f * Vf;
+                        bf = y_lin + 2.017232f * Uf;
+                    }
+                }
+                int r = (int)std::round(std::max(0.0f, std::min(255.0f, rf)));
+                int g = (int)std::round(std::max(0.0f, std::min(255.0f, gf)));
+                int b = (int)std::round(std::max(0.0f, std::min(255.0f, bf)));
+                size_t outIdx = ((size_t)yy * (size_t)width + (size_t)xx) * comp;
+                rgb[outIdx + 0] = (unsigned char)r;
+                rgb[outIdx + 1] = (unsigned char)g;
+                rgb[outIdx + 2] = (unsigned char)b;
+            }
+        }
+        handled = true;
+    }
+
+    // Case B: packed 4:2:2 (YUYV/UYVY)
+    if (!handled) {
+        if (pixfmt == V4L2_PIX_FMT_YUYV || pixfmt == V4L2_PIX_FMT_UYVY) {
+            bool isUYVY = (pixfmt == V4L2_PIX_FMT_UYVY);
+            const unsigned char* p = packed.data();
+            int strideBytes = width * 2;
+            for (int yy = 0; yy < height; ++yy) {
+                const unsigned char* row = p + (size_t)yy * strideBytes;
+                for (int xx = 0; xx < width; xx += 2) {
+                    unsigned char Y0, Y1, U0, V0;
+                    if (isUYVY) {
+                        U0 = row[xx*2 + 0];
+                        Y0 = row[xx*2 + 1];
+                        V0 = row[xx*2 + 2];
+                        Y1 = row[xx*2 + 3];
+                    } else {
+                        Y0 = row[xx*2 + 0];
+                        U0 = row[xx*2 + 1];
+                        Y1 = row[xx*2 + 2];
+                        V0 = row[xx*2 + 3];
+                    }
+                    auto convPixel = [&](unsigned char YY, unsigned char UU, unsigned char VV, size_t outIdx) {
+                        float Yf = (float)YY;
+                        float Uf = (float)UU - 128.0f;
+                        float Vf = (float)VV - 128.0f;
+                        float rf, gf, bf;
+                        if (full_range_flag == 1) {
+                            if (use_bt709_flag == 1) {
+                                rf = Yf + 1.792741f * Vf;
+                                gf = Yf - 0.213249f * Uf - 0.532909f * Vf;
+                                bf = Yf + 2.112402f * Uf;
+                            } else {
+                                rf = Yf + 1.596027f * Vf;
+                                gf = Yf - 0.391762f * Uf - 0.812968f * Vf;
+                                bf = Yf + 2.017232f * Uf;
+                            }
+                        } else {
+                            float y_lin = 1.164383f * (Yf - 16.0f);
+                            if (use_bt709_flag == 1) {
+                                rf = y_lin + 1.792741f * Vf;
+                                gf = y_lin - 0.213249f * Uf - 0.532909f * Vf;
+                                bf = y_lin + 2.112402f * Uf;
+                            } else {
+                                rf = y_lin + 1.596027f * Vf;
+                                gf = y_lin - 0.391762f * Uf - 0.812968f * Vf;
+                                bf = y_lin + 2.017232f * Uf;
+                            }
+                        }
+                        int r = (int)std::round(std::max(0.0f, std::min(255.0f, rf)));
+                        int g = (int)std::round(std::max(0.0f, std::min(255.0f, gf)));
+                        int b = (int)std::round(std::max(0.0f, std::min(255.0f, bf)));
+                        rgb[outIdx + 0] = (unsigned char)r;
+                        rgb[outIdx + 1] = (unsigned char)g;
+                        rgb[outIdx + 2] = (unsigned char)b;
+                    };
+                    size_t outIdx0 = ((size_t)yy * (size_t)width + (size_t)xx) * comp;
+                    size_t outIdx1 = outIdx0 + comp;
+                    convPixel(Y0, U0, V0, outIdx0);
+                    convPixel(Y1, U0, V0, outIdx1);
+                }
+            }
+            handled = true;
+        }
+    }
+
+    // Case C: raw RGB in packed
+    if (!handled) {
+        if (packedSize >= (size_t)width * (size_t)height * 3) {
+            std::memcpy(rgb.data(), packed.data(), (size_t)width * (size_t)height * 3);
+            handled = true;
+        } else {
+            std::cerr << "[screenshot-worker] unsupported pixfmt=" << pixfmt << " (" << fourcc << ") packedSize=" << packedSize << "\n";
+            return;
+        }
+    }
+
+    int stride = width * comp;
+    int ok = stbi_write_png(filename_png.c_str(), width, height, comp, rgb.data(), stride);
+    if (ok) std::cerr << "[screenshot-worker] saved: " << filename_png << "\n";
+    else std::cerr << "[screenshot-worker] failed to write PNG: " << filename_png << "\n";
+}
+// -----------------------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+    // startup logs to help debug early exits
+    std::cerr << "startup: begin\n";
+
+    static struct option longopts[] = {
+      {"uv-swap", required_argument, nullptr, 0},
+      {"range", required_argument, nullptr, 0},
+      {"matrix", required_argument, nullptr, 0},
+      {"auto-resize-window", no_argument, nullptr, 0},
+      {"cpu-uv-swap", no_argument, nullptr, 0},
+      {"help", no_argument, nullptr, 'h'},
+      {0,0,0,0}
+    };
+
+    for (;;) {
+      int idx = 0;
+      int c = getopt_long(argc, argv, "h", longopts, &idx);
+      if (c == -1) break;
+      if (c == 'h') {
+        print_usage(argv[0]);
+        return 0;
+      }
+      if (c == 0) {
+        std::string name = longopts[idx].name;
+        if (name == "uv-swap") {
+          std::string v = optarg ? optarg : "auto";
+          if (v == "auto") opt_uv_swap_override = -1;
+          else if (v == "0") opt_uv_swap_override = 0;
+          else if (v == "1") opt_uv_swap_override = 1;
+          else { std::cerr << "Invalid uv-swap value\n"; print_usage(argv[0]); return 1; }
+        } else if (name == "range") {
+          std::string v = optarg ? optarg : "limited";
+          if (v == "limited") opt_full_range = 0;
+          else if (v == "full") opt_full_range = 1;
+          else { std::cerr << "Invalid range\n"; print_usage(argv[0]); return 1; }
+        } else if (name == "matrix") {
+          std::string v = optarg ? optarg : "709";
+          if (v == "709") opt_use_bt709 = 1;
+          else if (v == "601") opt_use_bt709 = 0;
+          else { std::cerr << "Invalid matrix\n"; print_usage(argv[0]); return 1; }
+        } else if (name == "auto-resize-window") {
+          opt_auto_resize_window = true;
+        } else if (name == "cpu-uv-swap") {
+          opt_cpu_uv_swap = true;
+        }
       }
     }
-  }
 
-  int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
-  if (fd < 0) {
-    perror("open video0");
-    return 1;
-  }
+    std::cerr << "startup: opening device\n";
+    int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+      perror("open video0");
+      return 1;
+    }
+    std::cerr << "startup: opened device fd=" << fd << "\n";
 
-  uint32_t cur_width = DEFAULT_WIDTH, cur_height = DEFAULT_HEIGHT, cur_pixfmt = 0;
-  if (!get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt)) {
-    cur_width = DEFAULT_WIDTH;
-    cur_height = DEFAULT_HEIGHT;
-  }
+    uint32_t cur_width = DEFAULT_WIDTH, cur_height = DEFAULT_HEIGHT, cur_pixfmt = 0;
+    if (!get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt)) {
+      cur_width = DEFAULT_WIDTH;
+      cur_height = DEFAULT_HEIGHT;
+    }
 
-  v4l2_format fmt;
-  memset(&fmt, 0, sizeof(fmt));
-  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  fmt.fmt.pix_mp.width = cur_width;
-  fmt.fmt.pix_mp.height = cur_height;
-  fmt.fmt.pix_mp.pixelformat = v4l2_fourcc('N','V','2','4');
-  fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
-  fmt.fmt.pix_mp.num_planes = 1;
-  if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-    std::cerr << "VIDIOC_S_FMT: " << strerror(errno) << " (" << errno << ")\n";
-  }
-  get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt);
+    v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    fmt.fmt.pix_mp.width = cur_width;
+    fmt.fmt.pix_mp.height = cur_height;
+    fmt.fmt.pix_mp.pixelformat = v4l2_fourcc('N','V','2','4');
+    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    fmt.fmt.pix_mp.num_planes = 1;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+      std::cerr << "VIDIOC_S_FMT: " << strerror(errno) << " (" << errno << ")\n";
+    }
+    get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt);
 
-  v4l2_event_subscription sub;
-  memset(&sub, 0, sizeof(sub));
-  sub.type = V4L2_EVENT_SOURCE_CHANGE;
-  if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
-    // not fatal
-  }
+    v4l2_event_subscription sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.type = V4L2_EVENT_SOURCE_CHANGE;
+    if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
+      // not fatal
+    }
 
-  v4l2_requestbuffers req;
-  memset(&req, 0, sizeof(req));
-  req.count = BUF_COUNT;
-  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  req.memory = V4L2_MEMORY_MMAP;
-  if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-    perror("VIDIOC_REQBUFS");
-    close(fd);
-    return 1;
-  }
-
-  std::vector<std::vector<PlaneMap>> buffers(req.count);
-
-  for (unsigned i = 0; i < req.count; ++i) {
-    v4l2_buffer buf;
-    v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    buf.index = i;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.m.planes = planes;
-    buf.length = VIDEO_MAX_PLANES;
-
-    if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-      perror("VIDIOC_QUERYBUF");
+    v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = BUF_COUNT;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+      perror("VIDIOC_REQBUFS");
       close(fd);
       return 1;
     }
-    buffers[i].resize(buf.length);
-    for (unsigned p = 0; p < buf.length; ++p) {
-      buffers[i][p].length = planes[p].length;
-      buffers[i][p].addr = mmap(nullptr, planes[p].length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, planes[p].m.mem_offset);
-      if (buffers[i][p].addr == MAP_FAILED) {
-        perror("mmap plane");
+
+    std::vector<std::vector<PlaneMap>> buffers(req.count);
+
+    for (unsigned i = 0; i < req.count; ++i) {
+      v4l2_buffer buf;
+      v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
+      memset(&buf, 0, sizeof(buf));
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+      buf.index = i;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.m.planes = planes;
+      buf.length = VIDEO_MAX_PLANES;
+
+      if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+        perror("VIDIOC_QUERYBUF");
+        close(fd);
+        return 1;
+      }
+      buffers[i].resize(buf.length);
+      for (unsigned p = 0; p < buf.length; ++p) {
+        buffers[i][p].length = planes[p].length;
+        buffers[i][p].addr = mmap(nullptr, planes[p].length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, planes[p].m.mem_offset);
+        if (buffers[i][p].addr == MAP_FAILED) {
+          perror("mmap plane");
+          close(fd);
+          return 1;
+        }
+      }
+      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("VIDIOC_QBUF");
         close(fd);
         return 1;
       }
     }
-    if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-      perror("VIDIOC_QBUF");
+
+    int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (xioctl(fd, VIDIOC_STREAMON, &buf_type) < 0) {
+      perror("VIDIOC_STREAMON");
       close(fd);
       return 1;
     }
-  }
 
-  int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  if (xioctl(fd, VIDIOC_STREAMON, &buf_type) < 0) {
-    perror("VIDIOC_STREAMON");
-    close(fd);
-    return 1;
-  }
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+      std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
+      close(fd);
+      return 1;
+    }
+    std::cerr << "startup: SDL initialized\n";
 
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-    std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
-    close(fd);
-    return 1;
-  }
+    SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE,
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        (int)cur_width, (int)cur_height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!win) {
+      std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
+      close(fd);
+      return 1;
+    }
+    std::cerr << "startup: SDL window created\n";
 
-  SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE,
-      SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-      (int)cur_width, (int)cur_height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-  if (!win) {
-    std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
-    close(fd);
-    return 1;
-  }
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-  SDL_GLContext glc = SDL_GL_CreateContext(win);
-  if (!glc) {
-    std::cerr << "SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
-    close(fd);
-    return 1;
-  }
+    SDL_GLContext glc = SDL_GL_CreateContext(win);
+    if (!glc) {
+      std::cerr << "SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
+      close(fd);
+      return 1;
+    }
+    std::cerr << "startup: GL context created\n";
 
-  if (glewInit() != GLEW_OK) {
-    std::cerr << "GLEW init failed!" << std::endl;
-    close(fd);
-    return 1;
-  }
+    if (glewInit() != GLEW_OK) {
+      std::cerr << "GLEW init failed!" << std::endl;
+      close(fd);
+      return 1;
+    }
 
-  GLint gl_max_tex = 0;
-  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_max_tex);
+    GLint gl_max_tex = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_max_tex);
 
-  if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
-    // ignore failure
-  }
-  bool is_fullscreen = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+    if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
+      // ignore failure
+    }
+    bool is_fullscreen = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
 
-  int win_w = 0, win_h = 0;
-  SDL_GetWindowSize(win, &win_w, &win_h);
-  glViewport(0, 0, win_w, win_h);
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(win, &win_w, &win_h);
+    glViewport(0, 0, win_w, win_h);
 
-  {
     std::vector<std::string> attempts;
     std::string vertPath = findShaderFile("shader.vert.glsl", &attempts);
     if (vertPath.empty()) {
@@ -574,6 +756,7 @@ int main(int argc, char** argv) {
 
     GLuint program = createShaderProgram(vertPath.c_str(), fragPath.c_str());
     glUseProgram(program);
+    std::cerr << "startup: shader program created\n";
 
     float verts[] = {
       -1, -1,     0, 0,
@@ -625,13 +808,13 @@ int main(int argc, char** argv) {
     GLint loc_use_bt709 = glGetUniformLocation(program, "use_bt709");
     GLint loc_full_range = glGetUniformLocation(program, "full_range");
     GLint loc_view_mode = glGetUniformLocation(program, "view_mode");
+    GLint loc_segmentIndex = glGetUniformLocation(program, "segmentIndex");
 
     // NEW uniform locations
     GLint loc_offsetxy1 = glGetUniformLocation(program, "offsetxy1");
     if (loc_offsetxy1 < 0) {
         std::cerr << "Warning: uniform 'offsetxy1' not found (shader may optimize it out if unused)\n";
     }
-    GLint loc_segmentIndex = glGetUniformLocation(program, "segmentIndex"); // may be -1 if shader uses const
 
     GLint loc_rot = glGetUniformLocation(program, "rot");
     GLint loc_flip_x = glGetUniformLocation(program, "flip_x");
@@ -724,15 +907,14 @@ int main(int argc, char** argv) {
     }
 
     // Flip/rotation defaults (adjust if needed)
-    int flip_x = 0; // horizontal mirror default (0 = keine Spiegelung)
+    int flip_x = 0; // horizontal mirror default (0 = no mirror)
     int flip_y = 1; // vertical flip default
     int rotation = 0; // 0..3 (0=0deg,1=90cw,2=180deg,3=270deg)
-    // Upload initial values (only if locations valid)
     if (loc_flip_x >= 0) { glUseProgram(program); glUniform1i(loc_flip_x, flip_x); }
     if (loc_flip_y >= 0) { glUseProgram(program); glUniform1i(loc_flip_y, flip_y); }
     if (loc_rot >= 0)    { glUseProgram(program); glUniform1i(loc_rot, rotation); }
 
-    // GAP defaults: default to zero-space after row 5 and after row 10
+    // GAP defaults
     const int GAP_ARRAY_SIZE = 8;
     int gap_count = 2;
     int gap_rows_arr[GAP_ARRAY_SIZE] = { 5, 10, 0, 0, 0, 0, 0, 0 };
@@ -748,6 +930,18 @@ int main(int argc, char** argv) {
 
     std::vector<unsigned char> tmpUVbuf;
     std::vector<unsigned char> tmpFallback;
+
+    // store last frame for screenshot
+    std::vector<unsigned char> lastY;
+    std::vector<unsigned char> lastUV;
+    std::vector<unsigned char> lastPacked;    // fallback packed buffer
+    size_t lastPackedSize = 0;
+    int last_stride = 0;
+    int last_width = 0, last_height = 0;
+    bool lastIsNV12_NV21 = false;
+    uint32_t last_pixfmt = 0;
+
+    std::cerr << "startup: entering main loop\n";
 
     while (running) {
       int ret = poll(&pfd, 1, 2000);
@@ -863,6 +1057,48 @@ int main(int argc, char** argv) {
           glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, ybase);
         } else {
           upload_texture_tiled(GL_RED, texY, (int)cur_width, (int)cur_height, ybase, gl_max_tex, 1);
+        }
+
+        // store copy for screenshot (handle multiple input layouts)
+        last_pixfmt = cur_pixfmt;
+        if (isNV12_NV21 && ybase && uvbase) {
+            size_t ylen = (size_t)cur_width * (size_t)cur_height;
+            size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
+            if (lastY.size() < ylen) lastY.resize(ylen);
+            if (lastUV.size() < uvlen) lastUV.resize(uvlen);
+            memcpy(lastY.data(), ybase, ylen);
+            memcpy(lastUV.data(), uvbase, uvlen);
+            last_width = (int)cur_width;
+            last_height = (int)cur_height;
+            lastIsNV12_NV21 = true;
+            lastPacked.clear(); lastPackedSize = 0; last_stride = 0;
+        } else {
+            // fallback: store whole packed buffer (single-plane or packed formats)
+            unsigned char* packedPtr = nullptr;
+            size_t packedSize = 0;
+            if (uvbase == nullptr) {
+                packedPtr = base;
+                packedSize = bytesused0 > 0 ? bytesused0 : (size_t)cur_width * (size_t)cur_height * 2;
+                if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
+                memcpy(lastPacked.data(), packedPtr, packedSize);
+                lastPackedSize = packedSize;
+                last_stride = (int)cur_width * 2; // best-effort for packed 4:2:2
+                last_width = (int)cur_width;
+                last_height = (int)cur_height;
+                lastIsNV12_NV21 = false;
+            } else {
+                // two-plane but not NV12/NV21 — concatenate Y then UV
+                size_t ylen = (size_t)cur_width * (size_t)cur_height;
+                size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
+                packedSize = ylen + uvlen;
+                if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
+                memcpy(lastPacked.data(), ybase, ylen);
+                memcpy(lastPacked.data() + ylen, uvbase, uvlen);
+                lastPackedSize = packedSize;
+                last_width = (int)cur_width;
+                last_height = (int)cur_height;
+                lastIsNV12_NV21 = false;
+            }
         }
       }
 
@@ -1066,6 +1302,37 @@ int main(int argc, char** argv) {
                 glUniform1i(loc_rot, rotation);
             }
             std::cerr << "rotation = " << rotation << " (0=0deg,1=90deg,2=180deg,3=270deg) (step=180°)\n";
+          } else if (k == SDLK_s) {
+std::cerr << "s pressed: lastIsNV12_NV21=" << lastIsNV12_NV21
+          << " lastY=" << lastY.size() << " lastUV=" << lastUV.size()
+          << " lastPacked=" << lastPackedSize
+          << " last_pixfmt=" << last_pixfmt << " (" << fourcc_to_str(last_pixfmt) << ")"
+          << " last_w=" << last_width << " last_h=" << last_height
+          << " uv_swap=" << uv_swap << "\n";
+
+            if (last_width <= 0 || last_height <= 0) {
+                std::cerr << "No last frame dimensions available. Skipping.\n";
+            } else {
+                std::vector<unsigned char> copyY, copyUV, copyPacked;
+                if (lastIsNV12_NV21) {
+                    copyY = lastY;
+                    copyUV = lastUV;
+                } else {
+                    copyPacked = lastPacked;
+                }
+                int w = last_width, h = last_height;
+                uint32_t fmt = last_pixfmt;
+                int uv_swap_flag = uv_swap; // 0 NV12, 1 NV21
+                int use_bt709_flag = opt_use_bt709;
+                int full_range_flag = opt_full_range;
+
+                std::thread t(async_save_frame_to_png,
+                              std::move(copyY), std::move(copyUV), std::move(copyPacked),
+                              lastPackedSize, w, h, fmt, uv_swap_flag, use_bt709_flag, full_range_flag,
+                              std::string("display.png"));
+                t.detach();
+                std::cerr << "Screenshot request: saving async to display.png\n";
+            }
           }
         }
       }
@@ -1088,6 +1355,6 @@ int main(int argc, char** argv) {
         if (pm.addr && pm.length) munmap(pm.addr, pm.length);
 
     close(fd);
+    std::cerr << "shutdown: normal exit\n";
     return 0;
-  }
 }
