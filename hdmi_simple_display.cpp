@@ -279,6 +279,108 @@ static bool loadOffsetsFromModuleFiles(const std::array<std::string,3> &names, s
     return true;
 }
 
+// --- new struct for control parameters ---
+struct ControlParams {
+    // defaults match previous hard-coded shader constants
+    float fullInputW = 3840.0f;
+    float fullInputH = 2160.0f;
+    int segmentsX = 3;
+    int segmentsY = 3;
+    float subBlockW = 1280.0f;
+    float subBlockH = 720.0f;
+
+    float tileW = 128.0f;
+    float tileH = 144.0f;
+    float spacingX = 98.0f;
+    float spacingY = 90.0f;
+    float marginX = 0.0f;
+    int numTilesPerRow = 10;
+    int numTilesPerCol = 15;
+
+    int inputTilesTopToBottom = 1; // default: source tiles top->bottom
+
+    int moduleSerials[3] = {0,0,0};
+};
+
+// --- simple parser for control_ini.txt ---
+// Format: key = value
+// vector values comma separated, comments with # ignored
+static bool loadControlIni(const std::string &path, ControlParams &out) {
+    std::ifstream f;
+    std::string exeDir = getExecutableDir();
+    std::string candidates[2] = { joinPath(exeDir, path), path };
+    bool ok = false;
+    for (int c = 0; c < 2; ++c) {
+        if (!fileExists(candidates[c])) continue;
+        f.open(candidates[c]);
+        if (!f.is_open()) continue;
+        ok = true;
+        std::string line;
+        while (std::getline(f, line)) {
+            size_t s = line.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) continue;
+            if (line[s] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq+1);
+            // trim
+            auto trim = [](std::string &str) {
+                size_t a = str.find_first_not_of(" \t\r\n");
+                if (a == std::string::npos) { str.clear(); return; }
+                size_t b = str.find_last_not_of(" \t\r\n");
+                str = str.substr(a, b-a+1);
+            };
+            trim(key); trim(val);
+            if (key.empty() || val.empty()) continue;
+
+            if (key == "fullInputSize") {
+                // "W,H"
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.fullInputW = (float)a; out.fullInputH = (float)b; }
+            } else if (key == "segments") {
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.segmentsX = a; out.segmentsY = b; }
+            } else if (key == "subBlockSize") {
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.subBlockW = (float)a; out.subBlockH = (float)b; }
+            } else if (key == "tileSize") {
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.tileW = (float)a; out.tileH = (float)b; }
+            } else if (key == "spacing") {
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.spacingX = (float)a; out.spacingY = (float)b; }
+            } else if (key == "marginX") {
+                out.marginX = (float)atoi(val.c_str());
+            } else if (key == "numTiles") {
+                int a=0,b=0;
+                if (sscanf(val.c_str(), "%d,%d", &a, &b) == 2) { out.numTilesPerRow = a; out.numTilesPerCol = b; }
+            } else if (key == "inputTilesTopToBottom") {
+                out.inputTilesTopToBottom = atoi(val.c_str()) ? 1 : 0;
+            } else if (key == "moduleSerials") {
+                // comma separated three ints
+                int a=0,b=0,c2=0;
+                if (sscanf(val.c_str(), "%d,%d,%d", &a, &b, &c2) >= 1) {
+                    out.moduleSerials[0] = a; out.moduleSerials[1] = b; out.moduleSerials[2] = c2;
+                }
+            }
+        }
+        f.close();
+        std::cerr << "Loaded control ini: " << candidates[c] << "\n";
+        break;
+    }
+    if (!ok) {
+        std::cerr << "control_ini.txt not found in exeDir or cwd, using defaults\n";
+    }
+    std::cerr << "control: fullInputSize=" << out.fullInputW << "x" << out.fullInputH
+              << " tile=" << out.tileW << "x" << out.tileH
+              << " spacing=" << out.spacingX << "x" << out.spacingY
+              << " numTiles=" << out.numTilesPerRow << "x" << out.numTilesPerCol
+              << " inputTopToBottom=" << out.inputTilesTopToBottom
+              << " serials=" << out.moduleSerials[0] << "," << out.moduleSerials[1] << "," << out.moduleSerials[2] << "\n";
+    return true;
+}
+
 int main(int argc, char** argv) {
   static struct option longopts[] = {
     {"uv-swap", required_argument, nullptr, 0},
@@ -538,11 +640,31 @@ int main(int argc, char** argv) {
     GLint loc_gap_count = glGetUniformLocation(program, "gap_count");
     GLint loc_gap_rows = glGetUniformLocation(program, "gap_rows");
 
+    // Control/config uniforms (from control_ini.txt)
+    GLint loc_u_fullInputSize = glGetUniformLocation(program, "u_fullInputSize");
+    GLint loc_u_segmentsX = glGetUniformLocation(program, "u_segmentsX");
+    GLint loc_u_segmentsY = glGetUniformLocation(program, "u_segmentsY");
+    GLint loc_u_subBlockSize = glGetUniformLocation(program, "u_subBlockSize");
+
+    GLint loc_u_tileW = glGetUniformLocation(program, "u_tileW");
+    GLint loc_u_tileH = glGetUniformLocation(program, "u_tileH");
+    GLint loc_u_spacingX = glGetUniformLocation(program, "u_spacingX");
+    GLint loc_u_spacingY = glGetUniformLocation(program, "u_spacingY");
+    GLint loc_u_marginX = glGetUniformLocation(program, "u_marginX");
+    GLint loc_u_numTilesPerRow = glGetUniformLocation(program, "u_numTilesPerRow");
+    GLint loc_u_numTilesPerCol = glGetUniformLocation(program, "u_numTilesPerCol");
+
+    // input tile order and module serials
+    GLint loc_inputTilesTopToBottom = glGetUniformLocation(program, "inputTilesTopToBottom");
+    GLint loc_moduleSerials = glGetUniformLocation(program, "moduleSerials");
+
     // Log uniform locations to help debugging
     std::cerr << "Uniform locations: uv_swap=" << loc_uv_swap
               << " rot=" << loc_rot << " flip_x=" << loc_flip_x << " flip_y=" << loc_flip_y
               << " gap_count=" << loc_gap_count << " gap_rows=" << loc_gap_rows
-              << " offsetxy1=" << loc_offsetxy1 << " segmentIndex=" << loc_segmentIndex << "\n";
+              << " offsetxy1=" << loc_offsetxy1 << " segmentIndex=" << loc_segmentIndex
+              << " u_fullInputSize=" << loc_u_fullInputSize << " u_tileW=" << loc_u_tileW << " inputTilesTopToBottom=" << loc_inputTilesTopToBottom
+              << " moduleSerials=" << loc_moduleSerials << "\n";
 
     // Stable defaults for typical HDMI capture
     int uv_swap = 0;
@@ -563,6 +685,29 @@ int main(int argc, char** argv) {
     // Module files and initial load
     std::array<std::string,3> modFiles = { "modul1.txt", "modul2.txt", "modul3.txt" };
     std::vector<GLint> offsetData;
+
+    // Control params (from control_ini.txt)
+    ControlParams ctrl;
+    loadControlIni("control_ini.txt", ctrl);
+
+    // Upload initial control uniforms
+    glUseProgram(program);
+    if (loc_u_fullInputSize >= 0) glUniform2f(loc_u_fullInputSize, ctrl.fullInputW, ctrl.fullInputH);
+    if (loc_u_segmentsX >= 0) glUniform1i(loc_u_segmentsX, ctrl.segmentsX);
+    if (loc_u_segmentsY >= 0) glUniform1i(loc_u_segmentsY, ctrl.segmentsY);
+    if (loc_u_subBlockSize >= 0) glUniform2f(loc_u_subBlockSize, ctrl.subBlockW, ctrl.subBlockH);
+
+    if (loc_u_tileW >= 0) glUniform1f(loc_u_tileW, ctrl.tileW);
+    if (loc_u_tileH >= 0) glUniform1f(loc_u_tileH, ctrl.tileH);
+    if (loc_u_spacingX >= 0) glUniform1f(loc_u_spacingX, ctrl.spacingX);
+    if (loc_u_spacingY >= 0) glUniform1f(loc_u_spacingY, ctrl.spacingY);
+    if (loc_u_marginX >= 0) glUniform1f(loc_u_marginX, ctrl.marginX);
+    if (loc_u_numTilesPerRow >= 0) glUniform1i(loc_u_numTilesPerRow, ctrl.numTilesPerRow);
+    if (loc_u_numTilesPerCol >= 0) glUniform1i(loc_u_numTilesPerCol, ctrl.numTilesPerCol);
+
+    if (loc_inputTilesTopToBottom >= 0) glUniform1i(loc_inputTilesTopToBottom, ctrl.inputTilesTopToBottom);
+    if (loc_moduleSerials >= 0) glUniform1iv(loc_moduleSerials, 3, ctrl.moduleSerials);
+
     if (loadOffsetsFromModuleFiles(modFiles, offsetData)) {
         if (loc_offsetxy1 >= 0 && offsetData.size() >= 150 * 2) {
             glUseProgram(program);
@@ -579,7 +724,7 @@ int main(int argc, char** argv) {
     }
 
     // Flip/rotation defaults (adjust if needed)
-    int flip_x = 0; // horizontal mirror default
+    int flip_x = 0; // horizontal mirror default (0 = keine Spiegelung)
     int flip_y = 1; // vertical flip default
     int rotation = 0; // 0..3 (0=0deg,1=90cw,2=180deg,3=270deg)
     // Upload initial values (only if locations valid)
@@ -805,6 +950,23 @@ int main(int argc, char** argv) {
       if (loc_gap_count >= 0) glUniform1i(loc_gap_count, gap_count);
       if (loc_gap_rows >= 0)  glUniform1iv(loc_gap_rows, GAP_ARRAY_SIZE, gap_rows_arr);
 
+      // Ensure control uniforms are present
+      if (loc_u_fullInputSize >= 0) glUniform2f(loc_u_fullInputSize, ctrl.fullInputW, ctrl.fullInputH);
+      if (loc_u_segmentsX >= 0) glUniform1i(loc_u_segmentsX, ctrl.segmentsX);
+      if (loc_u_segmentsY >= 0) glUniform1i(loc_u_segmentsY, ctrl.segmentsY);
+      if (loc_u_subBlockSize >= 0) glUniform2f(loc_u_subBlockSize, ctrl.subBlockW, ctrl.subBlockH);
+
+      if (loc_u_tileW >= 0) glUniform1f(loc_u_tileW, ctrl.tileW);
+      if (loc_u_tileH >= 0) glUniform1f(loc_u_tileH, ctrl.tileH);
+      if (loc_u_spacingX >= 0) glUniform1f(loc_u_spacingX, ctrl.spacingX);
+      if (loc_u_spacingY >= 0) glUniform1f(loc_u_spacingY, ctrl.spacingY);
+      if (loc_u_marginX >= 0) glUniform1f(loc_u_marginX, ctrl.marginX);
+      if (loc_u_numTilesPerRow >= 0) glUniform1i(loc_u_numTilesPerRow, ctrl.numTilesPerRow);
+      if (loc_u_numTilesPerCol >= 0) glUniform1i(loc_u_numTilesPerCol, ctrl.numTilesPerCol);
+
+      if (loc_inputTilesTopToBottom >= 0) glUniform1i(loc_inputTilesTopToBottom, ctrl.inputTilesTopToBottom);
+      if (loc_moduleSerials >= 0) glUniform1iv(loc_moduleSerials, 3, ctrl.moduleSerials);
+
       if (!opt_cpu_uv_swap && loc_uv_swap >= 0) glUniform1i(loc_uv_swap, uv_swap);
       if (loc_use_bt709 >= 0) glUniform1i(loc_use_bt709, opt_use_bt709);
       if (loc_full_range >= 0) glUniform1i(loc_full_range, opt_full_range);
@@ -855,6 +1017,34 @@ int main(int argc, char** argv) {
             } else {
                 std::cerr << "Failed to read module files on reload\n";
             }
+
+            // Also reload control_ini.txt and upload control uniforms
+            ControlParams newCtrl;
+            if (loadControlIni("control_ini.txt", newCtrl)) {
+                glUseProgram(program);
+                if (loc_u_fullInputSize >= 0) glUniform2f(loc_u_fullInputSize, newCtrl.fullInputW, newCtrl.fullInputH);
+                if (loc_u_segmentsX >= 0) glUniform1i(loc_u_segmentsX, newCtrl.segmentsX);
+                if (loc_u_segmentsY >= 0) glUniform1i(loc_u_segmentsY, newCtrl.segmentsY);
+                if (loc_u_subBlockSize >= 0) glUniform2f(loc_u_subBlockSize, newCtrl.subBlockW, newCtrl.subBlockH);
+
+                if (loc_u_tileW >= 0) glUniform1f(loc_u_tileW, newCtrl.tileW);
+                if (loc_u_tileH >= 0) glUniform1f(loc_u_tileH, newCtrl.tileH);
+                if (loc_u_spacingX >= 0) glUniform1f(loc_u_spacingX, newCtrl.spacingX);
+                if (loc_u_spacingY >= 0) glUniform1f(loc_u_spacingY, newCtrl.spacingY);
+                if (loc_u_marginX >= 0) glUniform1f(loc_u_marginX, newCtrl.marginX);
+                if (loc_u_numTilesPerRow >= 0) glUniform1i(loc_u_numTilesPerRow, newCtrl.numTilesPerRow);
+                if (loc_u_numTilesPerCol >= 0) glUniform1i(loc_u_numTilesPerCol, newCtrl.numTilesPerCol);
+
+                if (loc_inputTilesTopToBottom >= 0) glUniform1i(loc_inputTilesTopToBottom, newCtrl.inputTilesTopToBottom);
+                if (loc_moduleSerials >= 0) glUniform1iv(loc_moduleSerials, 3, newCtrl.moduleSerials);
+
+                // update active ctrl
+                ctrl = newCtrl;
+                std::cerr << "Reloaded control_ini.txt and uploaded shader uniforms\n";
+            } else {
+                std::cerr << "control_ini.txt not found on reload; keeping previous control values\n";
+            }
+
           } else if (k == SDLK_h) {
             flip_x = !flip_x;
             if (loc_flip_x >= 0) {
