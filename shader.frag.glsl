@@ -24,15 +24,16 @@ const int numTilesPerRow = 10;
 const int numTilesPerCol = 15;
 
 // --- Offsets: werden aus C++ per glUniform2iv() gefüllt ---
-// offsetxy1[0..149] = ivec2 pairs for modules 1..3 concatenated (50 each)
-// Interpretation: offsetxy1[i].x positive = move tile to the right; negative = left
-//                 offsetxy1[i].y positive = move tile down; negative = up
 uniform ivec2 offsetxy1[150];
 
 // --- Rotation/Flip controls ---
 uniform int rot;      // 0=0deg,1=90degcw,2=180deg,3=270degcw
 uniform int flip_x;   // 0 = normal, 1 = mirrored horizontally (input texture)
 uniform int flip_y;   // 0 = normal, 1 = mirrored vertically (input texture)
+
+// --- Gap controls ---
+uniform int gap_count;
+uniform int gap_rows[8];
 
 // --- YUV-Parameter ---
 uniform int uv_swap;      // 0 = U in .r, V in .g ; 1 = swapped
@@ -61,6 +62,14 @@ vec2 rotate90_centered(vec2 uv, int k) {
     return r + c;
 }
 
+bool isGapZero(int gapIdx) {
+    for (int i = 0; i < 8; ++i) {
+        if (i >= gap_count) break;
+        if (gap_rows[i] == gapIdx) return true;
+    }
+    return false;
+}
+
 // --- Mapping: OpenGL 3.1+; gl_FragCoord.xy integer Pixelposition im Zielbild! ---
 void main()
 {
@@ -72,63 +81,76 @@ void main()
     int segRow = segIdx / segmentsX;
     vec2 subBlockOrigin = vec2(float(segCol) * subBlockSize.x, float(segRow) * subBlockSize.y);
 
-    // --- Kachelbereich berechnen (base grid position) ---
+    // --- tileCol (X) berechnen: bleibt wie gehabt (gleichmäßig in X) ---
     int tileCol = int((outPx.x - marginX) / (tileW + spacingX));
-    int tileRow = int(outPx.y / (tileH + spacingY));
-    // If outPx is outside the regular grid bounds, early out
+
+    // --- tileRow (Y) berechnen: akkumulativ unter Berücksichtigung von gaps ---
+    int tileRow = -1;
+    float yAcc = 0.0;
+    for (int r = 0; r < numTilesPerCol; ++r) {
+        float rowStart = yAcc;
+        float rowEnd = rowStart + tileH;
+        if (outPx.y >= rowStart && outPx.y < rowEnd) {
+            tileRow = r;
+            break;
+        }
+        // advance accumulator: add tile height and spacing (spacing may be zero if gap configured after this row)
+        // gap_rows entries are 1-based and indicate "gap after row g (i.e. between g and g+1) is zero".
+        bool gapAfterThisRow = isGapZero(r + 1);
+        if (!gapAfterThisRow) yAcc = rowEnd + spacingY;
+        else yAcc = rowEnd; // no spacing
+    }
+
+    // quickly reject out-of-grid if tileCol or tileRow invalid
     if (tileCol < 0 || tileCol >= numTilesPerRow || tileRow < 0 || tileRow >= numTilesPerCol) {
         FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
+    // Compute tileStartX (X unaffected by special gaps)
     float tileStartX = marginX + float(tileCol) * (tileW + spacingX);
-    float tileStartY = float(tileRow) * (tileH + spacingY);
 
-    // Determine index into offsets array (row-major within the subblock)
-    int tileIndexWithinSubblock = tileRow * numTilesPerRow + tileCol; // 0 .. (numTilesPerRow*numTilesPerCol-1)
+    // Compute tileStartY by recomputing accumulator up to tileRow (same logic as above to get exact start)
+    float tileStartY = 0.0;
+    for (int r = 0; r < tileRow; ++r) {
+        tileStartY += tileH;
+        bool gapAfterThisRow = isGapZero(r + 1);
+        if (!gapAfterThisRow) tileStartY += spacingY;
+    }
+
+    // Determine index into offset array (row-major within the subblock)
+    int tileIndexWithinSubblock = tileRow * numTilesPerRow + tileCol;
     int globalIndex = clamp(tileIndexWithinSubblock, 0, 149);
     ivec2 off = offsetxy1[globalIndex];
 
-    // --- Apply offset to tile's displayed rectangle (move the tile on the output) ---
-    // Interpret off.x (GLint): positive -> shift right, negative -> left
-    //              off.y (GLint): positive -> shift down, negative -> up
+    // Apply per-tile output offset (pixel units)
     vec2 tileRectStart = vec2(tileStartX, tileStartY) + vec2(float(off.x), float(off.y));
     vec2 tileRectEnd = tileRectStart + vec2(tileW, tileH);
 
-    // --- Check if current pixel lies in the (offset) tile rectangle ---
-    bool inTile = (outPx.x >= tileRectStart.x && outPx.x < tileRectEnd.x &&
-                   outPx.y >= tileRectStart.y && outPx.y < tileRectEnd.y);
-
-    if (!inTile) {
-        // not in this tile's displayed rectangle -> black (gap)
+    // Check whether current pixel lies within the (offset) tile rectangle
+    if (!(outPx.x >= tileRectStart.x && outPx.x < tileRectEnd.x &&
+          outPx.y >= tileRectStart.y && outPx.y < tileRectEnd.y)) {
         FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
-    // --- Offset within the displayed tile (pixel coords, 0..tileW-1 / 0..tileH-1) ---
-    float pxInTileX = outPx.x - tileRectStart.x; // 0 .. tileW-1
-    float pxInTileY = outPx.y - tileRectStart.y; // 0 .. tileH-1
+    // Pixel inside displayed tile
+    float pxInTileX = outPx.x - tileRectStart.x;
+    float pxInTileY = outPx.y - tileRectStart.y;
 
-    // --- Compute source position in the input image that corresponds to this tile pixel ---
-    // We keep the original mapping from tileCol/tileRow to source subblock:
-    // fetchX/fetchY compute the input pixel coordinate in the full input that this tile pixel should sample.
+    // Map to source pixel (source mapping unchanged by output offsets)
     float fetchX = tileW * float(tileCol) + pxInTileX;
     float fetchY = tileH * float(tileRow) + pxInTileY;
     vec2 inputCoord = subBlockOrigin + vec2(fetchX, fetchY);
 
-    // Note: We intentionally DO NOT apply offsetxy1 to inputCoord here.
-    // The offsets only move the tile in the OUTPUT (destination), as requested.
-
-    // clamp inputCoord into valid input range (avoid sampling outside)
+    // clamp inputCoord
     inputCoord = clamp(inputCoord, vec2(0.0), fullInputSize - vec2(1.0));
 
     // --- Texturkoordinaten auf [0,1] ---
     vec2 inputUVCoord = inputCoord / fullInputSize;
 
     // --- APPLY ROTATION / FLIP to the INPUT UV before sampling ---
-    // rotate around full input center, then flip, then clamp to [0,1]
-    vec2 uvTrans = inputUVCoord;
-    uvTrans = rotate90_centered(uvTrans, rot);
+    vec2 uvTrans = rotate90_centered(inputUVCoord, rot);
     if (flip_x == 1) uvTrans.x = 1.0 - uvTrans.x;
     if (flip_y == 1) uvTrans.y = 1.0 - uvTrans.y;
     uvTrans = clamp(uvTrans, vec2(0.0), vec2(1.0));
