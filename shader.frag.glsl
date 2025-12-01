@@ -1,53 +1,48 @@
 #version 140
 
-in vec2 TexCoord; // Wird hier nicht direkt verwendet, Mapping übernimmt die Logik!
+in vec2 TexCoord;
 out vec4 FragColor;
 
-// --- YUV-Textures ---
-uniform sampler2D texY;   // Y-Komponente
-uniform sampler2D texUV;  // UV-Komponente
+uniform sampler2D texY;
+uniform sampler2D texUV;
+uniform sampler2D texPattern;   // new: test pattern RGB texture (unit 2)
 
-// --- Segment-Uniform (wird vom Programm gesetzt) ---
 uniform int segmentIndex; // 1..16
+uniform vec2 u_fullInputSize;    // e.g. 3840,2160
+uniform int  u_segmentsX;
+uniform int  u_segmentsY;
+uniform vec2 u_subBlockSize;     // e.g. 1280,2160
 
-// --- Mosaik-/Segment-Uniforms (now configurable) ---
-uniform vec2 u_fullInputSize;       // was const vec2 fullInputSize
-uniform int  u_segmentsX;           // was const int segmentsX
-uniform int  u_segmentsY;           // was const int segmentsY
-uniform vec2 u_subBlockSize;        // was const vec2 subBlockSize
+uniform float u_tileW;           // 128
+uniform float u_tileH;           // 144
+uniform float u_spacingX;        // controlled by control_ini (use as-is)
+uniform float u_spacingY;        // controlled by control_ini (use as-is)
+uniform float u_marginX;         // left margin
+uniform int   u_numTilesPerRow;  // 10
+uniform int   u_numTilesPerCol;  // 15
 
-// --- Kachelgrößen/Abstände im Ausgangsbild (configurable) ---
-uniform float u_tileW;
-uniform float u_tileH;
-uniform float u_spacingX;
-uniform float u_spacingY;
-uniform float u_marginX;
-uniform int   u_numTilesPerRow;
-uniform int   u_numTilesPerCol;
-
-// --- Offsets: werden aus C++ per glUniform2iv() gefüllt ---
 uniform ivec2 offsetxy1[150];
 
-// --- Rotation/Flip controls ---
-uniform int rot;      // 0=0deg,1=90degcw,2=180deg,3=270degcw
-uniform int flip_x;   // 0 = normal, 1 = mirrored horizontally (input texture)
-uniform int flip_y;   // 0 = normal, 1 = mirrored vertically (input texture)
+uniform int rot;
+uniform int flip_x;
+uniform int flip_y;
 
-// --- Gap controls ---
 uniform int gap_count;
 uniform int gap_rows[8];
 
-// --- Control: input tile order ---
 uniform int inputTilesTopToBottom;
 
-// --- Module serial numbers (for info/diagnostics) ---
-uniform int moduleSerials[3];
+uniform int uv_swap;
+uniform int full_range;
+uniform int use_bt709;
+uniform int view_mode;
 
-// --- YUV-Parameter ---
-uniform int uv_swap;      // 0 = U in .r, V in .g ; 1 = swapped
-uniform int full_range;   // 0 = limited (video), 1 = full (pc)
-uniform int use_bt709;    // 1 = BT.709, 0 = BT.601
-uniform int view_mode;    // 0 = normal, 1 = show Y, 2 = show U, 3 = show V
+uniform int u_textureIsFull;     // 1 = full input texture bound, 0 = subblock
+uniform vec2 u_windowSize;       // SDL window in pixels
+uniform vec2 u_outputSize;       // legacy / fallback
+uniform int  u_alignTopLeft;     // 1 = align top-left, 0 = center
+
+uniform int u_showPattern;       // 1 = show pattern (no input), 0 = normal
 
 // helper: rotate a point (u,v) around center (0.5,0.5) by k*90deg clockwise
 vec2 rotate90_centered(vec2 uv, int k) {
@@ -55,18 +50,10 @@ vec2 rotate90_centered(vec2 uv, int k) {
     vec2 p = uv - c;
     vec2 r;
     int kk = k & 3;
-    if (kk == 0) {
-        r = p;
-    } else if (kk == 1) {
-        // 90 cw: (x,y) -> (y, -x)
-        r = vec2(p.y, -p.x);
-    } else if (kk == 2) {
-        // 180: (x,y) -> (-x, -y)
-        r = vec2(-p.x, -p.y);
-    } else {
-        // 270 cw: (x,y) -> (-y, x)
-        r = vec2(-p.y, p.x);
-    }
+    if (kk == 0) r = p;
+    else if (kk == 1) r = vec2(p.y, -p.x);
+    else if (kk == 2) r = vec2(-p.x, -p.y);
+    else r = vec2(-p.y, p.x);
     return r + c;
 }
 
@@ -78,7 +65,7 @@ bool isGapZero(int gapIdx) {
     return false;
 }
 
-// compute total grid height (sum of all rows + spacing considering gaps)
+// compute total grid height considering vertical gaps (exact pixel values from control_ini)
 float computeTotalGridHeight(int numRows, float tileH, float spacingY) {
     float h = 0.0;
     for (int r = 0; r < numRows; ++r) {
@@ -90,148 +77,199 @@ float computeTotalGridHeight(int numRows, float tileH, float spacingY) {
     return h;
 }
 
-// --- Mapping: OpenGL 3.1+; gl_FragCoord.xy integer Pixelposition im Zielbild! ---
+vec3 tileIndexToColor(int idx) {
+    float r = float((idx * 37) & 0xFF) / 255.0;
+    float g = float((idx * 73) & 0xFF) / 255.0;
+    float b = float((idx * 151) & 0xFF) / 255.0;
+    return vec3(r,g,b);
+}
+
 void main()
 {
-    vec2 outPx = gl_FragCoord.xy;
+    // If test pattern requested, render it immediately (pattern texture if bound, else procedural)
+    if (u_showPattern == 1) {
+        // If a pattern texture is provided (bound to unit 2), show it.
+        // We invert v so user-supplied images map naturally.
+        vec4 tcol = texture(texPattern, vec2(TexCoord.x, 1.0 - TexCoord.y));
+        // If pattern texture is empty or not provided (will sample black), fall back to procedural.
+        if (tcol.r > 0.0 || tcol.g > 0.0 || tcol.b > 0.0) {
+            FragColor = tcol;
+            return;
+        }
+        // Procedural fallback pattern: three vertical columns (red, green, blue) with white tile borders.
+        // Use u_outputSize/u_tileW to draw grid-like tiles similar to your test image.
+        float tileW = u_tileW;
+        float tileH = u_tileH;
+        float spacingX = u_spacingX;
+        float spacingY = u_spacingY;
+        float marginX = u_marginX;
+        vec2 win = max(u_windowSize, vec2(1.0));
+        vec2 grid = vec2(2.0 * marginX + float(u_numTilesPerRow) * tileW + float(u_numTilesPerRow - 1) * spacingX,
+                         computeTotalGridHeight(u_numTilesPerCol, tileH, spacingY));
+        // Map TexCoord to logical coordinates (approx)
+        vec2 px = TexCoord * win;
+        // Determine column in 3 vertical bands
+        float band = floor(3.0 * px.x / win.x);
+        vec3 col = vec3(0.5,0.0,0.0);
+        if (band < 1.0) col = vec3(0.8, 0.1, 0.1);
+        else if (band < 2.0) col = vec3(0.1, 0.8, 0.1);
+        else col = vec3(0.15, 0.15, 0.9);
+        // draw thin white grid lines: create virtual tile coordinates
+        float gx = mod(px.x, tileW + spacingX);
+        float gy = mod(px.y, tileH + spacingY);
+        if (gx < 2.0 || gy < 2.0) {
+            FragColor = vec4(1.0,1.0,1.0,1.0);
+        } else {
+            FragColor = vec4(col, 1.0);
+        }
+        return;
+    }
 
-    // --- Subblock berechnen ---
+    // --- Compute logical grid size from control params (use spacing exactly as given) ---
+    float gridW = 2.0 * u_marginX + float(u_numTilesPerRow) * u_tileW + float(u_numTilesPerRow - 1) * u_spacingX;
+    float gridH = computeTotalGridHeight(u_numTilesPerCol, u_tileH, u_spacingY);
+
+    // --- Determine integer scale to map logical grid onto window pixels ---
+    vec2 win = max(u_windowSize, vec2(1.0));
+    vec2 grid = max(vec2(gridW, gridH), vec2(1.0));
+    float sx = floor(win.x / grid.x);
+    float sy = floor(win.y / grid.y);
+    float scale = max(1.0, min(sx, sy));
+    vec2 usedPx = grid * scale;
+
+    vec2 origin;
+    if (u_alignTopLeft == 1) {
+        origin = vec2(0.0, win.y - usedPx.y);
+    } else {
+        origin = (win - usedPx) * 0.5;
+    }
+
+    vec2 winPx = gl_FragCoord.xy;
+    vec2 logicalBottom = (winPx - origin) / scale;
+
+    if (logicalBottom.x < 0.0 || logicalBottom.y < 0.0 || logicalBottom.x >= grid.x || logicalBottom.y >= grid.y) {
+        FragColor = vec4(0.0,0.0,0.0,1.0);
+        return;
+    }
+
+    vec2 outPxTL = vec2(logicalBottom.x, grid.y - 1.0 - logicalBottom.y);
+
     int segIdx = clamp(segmentIndex, 1, 16) - 1;
-    int segCol = segIdx % u_segmentsX;
-    int segRow = segIdx / u_segmentsX;
+    int segCol = segIdx % max(1, u_segmentsX);
+    int segRow = segIdx / max(1, u_segmentsX);
     vec2 subBlockOrigin = vec2(float(segCol) * u_subBlockSize.x, float(segRow) * u_subBlockSize.y);
 
-    // --- X (tileCol) ---
-    int tileCol = int((outPx.x - u_marginX) / (u_tileW + u_spacingX));
+    float cellW = u_tileW + u_spacingX;
+    int tileCol = int(floor((outPxTL.x - u_marginX + 1e-6) / cellW));
 
-    // --- compute total grid height using uniforms ---
-    float totalGridH = computeTotalGridHeight(u_numTilesPerCol, u_tileH, u_spacingY);
-
-    // yFromTop: distance in pixels from top of the grid
-    float yFromTop = totalGridH - outPx.y;
-
-    // --- tileRow: accumulate rows from top using yFromTop ---
     int tileRow = -1;
-    float yAccTop = 0.0;
+    float yAcc = 0.0;
     for (int r = 0; r < u_numTilesPerCol; ++r) {
-        float rowStart = yAccTop;
+        float rowStart = yAcc;
         float rowEnd = rowStart + u_tileH;
-        if (yFromTop >= rowStart && yFromTop < rowEnd) {
+        if (outPxTL.y >= rowStart && outPxTL.y < rowEnd) {
             tileRow = r;
             break;
         }
-        bool gapAfterThisRow = isGapZero(r + 1);
-        if (!gapAfterThisRow) yAccTop = rowEnd + u_spacingY;
-        else yAccTop = rowEnd;
+        bool gapAfter = isGapZero(r + 1);
+        if (!gapAfter) yAcc = rowEnd + u_spacingY;
+        else yAcc = rowEnd;
     }
 
-    // quick reject
     if (tileCol < 0 || tileCol >= u_numTilesPerRow || tileRow < 0 || tileRow >= u_numTilesPerCol) {
-        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        FragColor = vec4(0.0,0.0,0.0,1.0);
         return;
     }
 
-    // --- Compute tileStartX (left) ---
     float tileStartX = u_marginX + float(tileCol) * (u_tileW + u_spacingX);
 
-    // --- Compute tileStartY measured from TOP, convert to bottom-origin coordinates
     float tileStartY_top = 0.0;
     for (int r = 0; r < tileRow; ++r) {
         tileStartY_top += u_tileH;
-        bool gapAfterThisRow = isGapZero(r + 1);
-        if (!gapAfterThisRow) tileStartY_top += u_spacingY;
+        bool gapAfter = isGapZero(r + 1);
+        if (!gapAfter) tileStartY_top += u_spacingY;
     }
-    float tileStartY = totalGridH - (tileStartY_top + u_tileH);
 
-    // Determine index into offset array (row-major within the subblock)
     int tileIndexWithinSubblock = tileRow * u_numTilesPerRow + tileCol;
-    int globalIndex = clamp(tileIndexWithinSubblock, 0, 149);
-    ivec2 off = offsetxy1[globalIndex];
+    int clampedIndex = clamp(tileIndexWithinSubblock, 0, 149);
+    ivec2 off_i = offsetxy1[clampedIndex];
+    float offx = float(off_i.x);
+    float offy = float(off_i.y);
 
-    // Apply per-tile output offset (pixel units)
-    vec2 tileRectStart = vec2(tileStartX, tileStartY) + vec2(float(off.x), float(off.y));
+    vec2 tileRectStart = vec2(tileStartX, tileStartY_top);
     vec2 tileRectEnd = tileRectStart + vec2(u_tileW, u_tileH);
 
-    // Check whether current pixel lies within the (offset) tile rectangle
-    if (!(outPx.x >= tileRectStart.x && outPx.x < tileRectEnd.x &&
-          outPx.y >= tileRectStart.y && outPx.y < tileRectEnd.y)) {
-        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    if (!(outPxTL.x >= tileRectStart.x && outPxTL.x < tileRectEnd.x &&
+          outPxTL.y >= tileRectStart.y && outPxTL.y < tileRectEnd.y)) {
+        FragColor = vec4(0.0,0.0,0.0,1.0);
         return;
     }
 
-    // Pixel inside displayed tile
-    float pxInTileX = outPx.x - tileRectStart.x;
-    float pxInTileY = outPx.y - tileRectStart.y;
+    float pxInTileX = outPxTL.x - tileRectStart.x;
+    float pxInTileY = outPxTL.y - tileRectStart.y;
 
-    // Determine source row depending on inputTilesTopToBottom
-    int sourceTileRow;
-    if (inputTilesTopToBottom == 1) {
-        sourceTileRow = tileRow;
-    } else {
-        sourceTileRow = (u_numTilesPerCol - 1) - tileRow;
+    int sourceTileRow = inputTilesTopToBottom == 1 ? tileRow : (u_numTilesPerCol - 1 - tileRow);
+
+    float fetchX = u_tileW * float(tileCol) + pxInTileX - offx;
+    float fetchY = u_tileH * float(sourceTileRow) + pxInTileY - offy;
+
+    float tileSrcX0 = u_tileW * float(tileCol);
+    float tileSrcX1 = tileSrcX0 + u_tileW;
+    float tileSrcY0 = u_tileH * float(sourceTileRow);
+    float tileSrcY1 = tileSrcY0 + u_tileH;
+
+    if (fetchX < tileSrcX0 || fetchX >= tileSrcX1 || fetchY < tileSrcY0 || fetchY >= tileSrcY1) {
+        FragColor = vec4(0.0,0.0,0.0,1.0);
+        return;
     }
 
-    // Map to source pixel (do NOT invert pxInTileY here)
-    float fetchX = u_tileW * float(tileCol) + pxInTileX;
-    float fetchY = u_tileH * float(sourceTileRow) + pxInTileY;
     vec2 inputCoord = subBlockOrigin + vec2(fetchX, fetchY);
-
-    // clamp inputCoord
     inputCoord = clamp(inputCoord, vec2(0.0), u_fullInputSize - vec2(1.0));
 
-    // --- Texturkoordinaten auf [0,1] ---
-    vec2 inputUVCoord = inputCoord / u_fullInputSize;
+    vec2 inputUV;
+    if (u_textureIsFull == 1) {
+        inputUV.x = inputCoord.x / u_fullInputSize.x;
+        inputUV.y = 1.0 - (inputCoord.y / u_fullInputSize.y);
+    } else {
+        vec2 local = inputCoord - subBlockOrigin;
+        inputUV.x = local.x / u_subBlockSize.x;
+        inputUV.y = 1.0 - (local.y / u_subBlockSize.y);
+    }
+    inputUV = clamp(inputUV, vec2(0.0), vec2(1.0));
 
-    // --- APPLY ROTATION / FLIP to the INPUT UV before sampling ---
-    vec2 uvTrans = rotate90_centered(inputUVCoord, rot);
+    vec2 uvTrans = rotate90_centered(inputUV, rot);
     if (flip_x == 1) uvTrans.x = 1.0 - uvTrans.x;
     if (flip_y == 1) uvTrans.y = 1.0 - uvTrans.y;
     uvTrans = clamp(uvTrans, vec2(0.0), vec2(1.0));
 
-    // --- YUV Sample using transformed input UV ---
-    float Y = texture(texY, uvTrans).r * 255.0;
-    vec2 uv = texture(texUV, uvTrans).rg * 255.0;
-
-    float U = uv.x;
-    float V = uv.y;
-    if (uv_swap == 1) { float tmp = U; U = V; V = tmp; }
-
-    // --- Debugkanal-View ---
     if (view_mode == 1) {
-        float yy = clamp(Y / 255.0, 0.0, 1.0);
-        FragColor = vec4(vec3(yy), 1.0);
+        vec3 col = vec3(fract(inputUV.x * 8.0), fract((1.0 - inputUV.y) * 8.0), 0.0);
+        FragColor = vec4(smoothstep(vec3(0.15), vec3(0.85), col), 1.0);
         return;
     } else if (view_mode == 2) {
-        float uu = clamp((U - 128.0) / 256.0 + 0.5, 0.0, 1.0);
-        FragColor = vec4(vec3(uu), 1.0);
-        return;
-    } else if (view_mode == 3) {
-        float vv = clamp((V - 128.0) / 256.0 + 0.5, 0.0, 1.0);
-        FragColor = vec4(vec3(vv), 1.0);
+        vec3 c = tileIndexToColor(tileIndexWithinSubblock);
+        FragColor = vec4(c, 1.0);
         return;
     }
 
-    // --- YUV→RGB Umwandlung ---
-    float y;
-    if (full_range == 1) y = Y;
-    else y = 1.164383 * (Y - 16.0);
+    float Y = texture(texY, uvTrans).r * 255.0;
+    vec2 uv = texture(texUV, uvTrans).rg * 255.0;
+    float U = uv.x, V = uv.y;
+    if (uv_swap == 1) { float tmp = U; U = V; V = tmp; }
 
-    float u = U - 128.0;
-    float v = V - 128.0;
-
+    float yVal = (full_range == 1) ? Y : 1.164383 * (Y - 16.0);
+    float uVal = U - 128.0;
+    float vVal = V - 128.0;
     vec3 rgb;
     if (use_bt709 == 1) {
-        float r = y + 1.792741 * v;
-        float g = y - 0.213249 * u - 0.532909 * v;
-        float b = y + 2.112402 * u;
-        rgb = vec3(r, g, b);
+        rgb.r = yVal + 1.792741 * vVal;
+        rgb.g = yVal - 0.213249 * uVal - 0.532909 * vVal;
+        rgb.b = yVal + 2.112402 * uVal;
     } else {
-        float r = y + 1.596027 * v;
-        float g = y - 0.391762 * u - 0.812968 * v;
-        float b = y + 2.017232 * u;
-        rgb = vec3(r, g, b);
+        rgb.r = yVal + 1.596027 * vVal;
+        rgb.g = yVal - 0.391762 * uVal - 0.812968 * vVal;
+        rgb.b = yVal + 2.017232 * uVal;
     }
-
     rgb = clamp(rgb / 255.0, vec3(0.0), vec3(1.0));
     FragColor = vec4(rgb, 1.0);
 }

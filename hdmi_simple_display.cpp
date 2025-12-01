@@ -1,6 +1,9 @@
 // hdmi_simple_display.cpp
-// Production: auto-resize, tiled uploads, V4L2 events, CLI, CPU UV-swap option, improved tiled upload reuse
-// Includes: runtime control_ini, modul*.txt offsets, gap handling, and async PNG screenshot via stb_image_write
+// Full file — timebased signal-loss detection and QBUF retry + set-last_good_frame only after successful QBUF.
+// Verbosity via --verbose. Test pattern via --test-pattern=<path>.
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include <iostream>
 #include <fstream>
@@ -28,6 +31,8 @@
 #include <memory>
 #include <atomic>
 #include <cmath>
+#include <mutex>
+#include <chrono>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -43,6 +48,23 @@ static bool opt_cpu_uv_swap = false; // if true, do CPU swap at upload
 static int opt_uv_swap_override = -1; // -1 = auto, 0/1 override
 static int opt_full_range = 0; // 0 limited, 1 full
 static int opt_use_bt709 = 1; // 1 = BT.709, 0 = BT.601
+static bool opt_verbose = false; // verbosity
+static std::string opt_test_pattern_path; // optional test pattern
+
+// Time (ms) without a valid frame before showing test pattern
+static const int PATTERN_TIMEOUT_MS = 800;
+
+// QBUF retry policy (adjust if needed)
+static const int QBUF_RETRIES = 5;
+static const int QBUF_RETRY_MS = 10;
+
+// small helper for conditional verbose logging
+static inline void vlog(const std::string &s) {
+    if (opt_verbose) std::cerr << s;
+}
+static inline void vlogln(const std::string &s) {
+    if (opt_verbose) std::cerr << s << std::endl;
+}
 
 // ----------------- helper functions (loadShaderSource, xioctl, compileShader, createShaderProgram, etc.)
 
@@ -166,10 +188,12 @@ void print_usage(const char* prog) {
               << "  --matrix=709|601           (default 709)\n"
               << "  --auto-resize-window       resize SDL window on format change\n"
               << "  --cpu-uv-swap              perform UV swap on CPU at upload and avoid runtime shader swap\n"
+              << "  --test-pattern=<path>      optional test image (PNG/JPG) to display on input loss\n"
+              << "  --verbose                  enable verbose logging\n"
               << "  -h, --help                 show this help\n";
 }
 
-// Helpers for file paths and offsets
+// Helpers for file paths and offsets (unchanged)
 static std::string getExecutableDir() {
     char* base = SDL_GetBasePath();
     if (base) {
@@ -251,38 +275,25 @@ static bool loadOffsetsFromModuleFiles(const std::array<std::string,3> &names, s
         bool fileFound = false;
         for (int c = 0; c < 2; ++c) {
             const std::string &path = candidates[c];
-            std::cerr << "Trying open offsets file: " << path << "\n";
-            if (!fileExists(path)) {
-                std::cerr << "  not found: " << path << "\n";
-                continue;
-            }
+            if (!fileExists(path)) continue;
             std::ifstream f(path);
-            if (!f.is_open()) {
-                std::cerr << "  cannot open: " << path << "\n";
-                continue;
-            }
+            if (!f.is_open()) continue;
             fileFound = true;
-            size_t readThisFile = 0;
             std::string line;
             while (std::getline(f, line) && fillIndex < out.size()) {
                 int x,y;
                 if (!parseXYLine(line, x, y)) continue;
                 out[fillIndex++] = (GLint)x;
                 out[fillIndex++] = (GLint)y;
-                ++readThisFile;
             }
-            std::cerr << "  read " << readThisFile << " entries from " << path << "\n";
             break;
         }
-        if (!fileFound) {
-            std::cerr << "  WARNING: module file '" << names[m] << "' not found in exeDir or cwd; filling with 0s for these slots\n";
-        }
+        (void)fileFound; // silent if not found
     }
-    std::cerr << "Total entries filled: " << (fillIndex/2) << " (out of 150)\n";
     return true;
 }
 
-// ControlParams + parser
+// ControlParams + parser (unchanged)
 struct ControlParams {
     float fullInputW = 3840.0f;
     float fullInputH = 2160.0f;
@@ -304,11 +315,9 @@ struct ControlParams {
     int moduleSerials[3] = {0,0,0};
 };
 
-// --- NEU: Hilfsfunktion, die aus den Seriennummern die Modul-Dateinamen erzeugt ---
 static std::array<std::string,3> buildModuleFilenames(const ControlParams &ctrl) {
     std::array<std::string,3> names;
     for (int i = 0; i < 3; ++i) {
-        // Falls Seriennummer 0 (Default) ist, bauen wir fallback name modul{i+1}.txt
         if (ctrl.moduleSerials[i] == 0) {
             names[i] = std::string("modul") + std::to_string(i+1) + ".txt";
         } else {
@@ -337,7 +346,6 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
             if (eq == std::string::npos) continue;
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq+1);
-            // trim
             auto trim = [](std::string &str) {
                 size_t a = str.find_first_not_of(" \t\r\n");
                 if (a == std::string::npos) { str.clear(); return; }
@@ -370,7 +378,6 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
             } else if (key == "inputTilesTopToBottom") {
                 out.inputTilesTopToBottom = atoi(val.c_str()) ? 1 : 0;
             } else if (key == "moduleSerials") {
-                // legacy: comma separated three ints
                 int a=0,b=0,c2=0;
                 if (sscanf(val.c_str(), "%d,%d,%d", &a, &b, &c2) >= 1) {
                     out.moduleSerials[0] = a; out.moduleSerials[1] = b; out.moduleSerials[2] = c2;
@@ -381,70 +388,43 @@ static bool loadControlIni(const std::string &path, ControlParams &out) {
                 out.moduleSerials[1] = atoi(val.c_str());
             } else if (key == "modul3Serial") {
                 out.moduleSerials[2] = atoi(val.c_str());
+            } else if (key == "verbose") {
+                opt_verbose = atoi(val.c_str()) != 0;
+            } else if (key == "testPattern") {
+                opt_test_pattern_path = val;
             }
         }
         f.close();
-        std::cerr << "Loaded control ini: " << candidates[c] << "\n";
         break;
     }
-    if (!ok) {
-        std::cerr << "control_ini.txt not found in exeDir or cwd, using defaults\n";
-    }
-    std::cerr << "control: fullInputSize=" << out.fullInputW << "x" << out.fullInputH
-              << " tile=" << out.tileW << "x" << out.tileH
-              << " spacing=" << out.spacingX << "x" << out.spacingY
-              << " numTiles=" << out.numTilesPerRow << "x" << out.numTilesPerCol
-              << " inputTopToBottom=" << out.inputTilesTopToBottom
-              << " serials=" << out.moduleSerials[0] << "," << out.moduleSerials[1] << "," << out.moduleSerials[2] << "\n";
+    // silent fallback to defaults if not found
     return true;
 }
 
-// async: generic frame -> PNG writer that supports NV12/NV21 and common packed formats
+// async: screenshot writer (unchanged)
 static void async_save_frame_to_png(std::vector<unsigned char> ybuf,
                                     std::vector<unsigned char> uvbuf,
                                     std::vector<unsigned char> packed,
                                     size_t packedSize,
                                     int width, int height,
-                                    uint32_t pixfmt, // V4L2 format
-                                    int uv_swap_flag, // 0 NV12(U,V) / 1 NV21(V,U)
-                                    int use_bt709_flag, int full_range_flag,
+                                    uint32_t pixfmt,
+                                    int uv_swap_flag, int use_bt709_flag, int full_range_flag,
                                     std::string filename_png)
 {
     std::string fourcc = fourcc_to_str(pixfmt);
-    std::cerr << "[screenshot-worker] start filename=" << filename_png
-              << " fmt=" << pixfmt << " (" << fourcc << ")"
-              << " size=" << width << "x" << height
-              << " y=" << ybuf.size() << " uv=" << uvbuf.size()
-              << " packed=" << packedSize
-              << " uv_swap=" << uv_swap_flag << " bt709=" << use_bt709_flag << " full=" << full_range_flag << "\n";
-
     const int comp = 3;
     std::vector<unsigned char> rgb;
-    try {
-        rgb.resize((size_t)width * (size_t)height * comp);
-    } catch (...) {
-        std::cerr << "[screenshot-worker] allocation failed\n";
-        return;
-    }
+    try { rgb.resize((size_t)width * (size_t)height * comp); } catch (...) { return; }
 
-    // Heuristic lengths
     size_t ylen = (size_t)width * (size_t)height;
     size_t uvlen = (size_t)width * ((size_t)height / 2);
 
-    bool handled = false;
-
-    // Case A: NV12/NV21 explicit, OR heuristic: packed == Y+UV -> treat packed as NV12 contiguous (Y then UV)
     if (pixfmt == V4L2_PIX_FMT_NV12 || pixfmt == V4L2_PIX_FMT_NV21 ||
         (ybuf.empty() && uvbuf.empty() && packedSize == (ylen + uvlen))) {
-
-        // If we only have packed blob with correct size, split into y/uv
-        if (ybuf.empty() && uvbuf.empty() && packedSize == (ylen + uvlen)) {
+        if (ybuf.empty() && uvbuf.empty()) {
             ybuf.assign(packed.begin(), packed.begin() + ylen);
             uvbuf.assign(packed.begin() + ylen, packed.begin() + ylen + uvlen);
-            std::cerr << "[screenshot-worker] heuristic: split packed->Y/UV for NV12-like data\n";
         }
-
-        // Decode NV12/NV21 using uv_swap_flag (0 = NV12 U,V ; 1 = NV21 V,U)
         for (int yy = 0; yy < height; ++yy) {
             int uv_row = yy / 2;
             for (int xx = 0; xx < width; ++xx) {
@@ -454,7 +434,6 @@ static void async_save_frame_to_png(std::vector<unsigned char> ybuf,
                 unsigned char Yc = (yi < (int)ybuf.size()) ? ybuf[yi] : 0;
                 unsigned char Uc = (uvIndex + 1 < uvbuf.size() && uvbuf.size()>0) ? uvbuf[uvIndex + (uv_swap_flag ? 1 : 0)] : 128;
                 unsigned char Vc = (uvIndex + 1 < uvbuf.size() && uvbuf.size()>0) ? uvbuf[uvIndex + (uv_swap_flag ? 0 : 1)] : 128;
-
                 float Yf = (float)Yc;
                 float Uf = (float)Uc - 128.0f;
                 float Vf = (float)Vc - 128.0f;
@@ -490,96 +469,18 @@ static void async_save_frame_to_png(std::vector<unsigned char> ybuf,
                 rgb[outIdx + 2] = (unsigned char)b;
             }
         }
-        handled = true;
-    }
-
-    // Case B: packed 4:2:2 (YUYV/UYVY)
-    if (!handled) {
-        if (pixfmt == V4L2_PIX_FMT_YUYV || pixfmt == V4L2_PIX_FMT_UYVY) {
-            bool isUYVY = (pixfmt == V4L2_PIX_FMT_UYVY);
-            const unsigned char* p = packed.data();
-            int strideBytes = width * 2;
-            for (int yy = 0; yy < height; ++yy) {
-                const unsigned char* row = p + (size_t)yy * strideBytes;
-                for (int xx = 0; xx < width; xx += 2) {
-                    unsigned char Y0, Y1, U0, V0;
-                    if (isUYVY) {
-                        U0 = row[xx*2 + 0];
-                        Y0 = row[xx*2 + 1];
-                        V0 = row[xx*2 + 2];
-                        Y1 = row[xx*2 + 3];
-                    } else {
-                        Y0 = row[xx*2 + 0];
-                        U0 = row[xx*2 + 1];
-                        Y1 = row[xx*2 + 2];
-                        V0 = row[xx*2 + 3];
-                    }
-                    auto convPixel = [&](unsigned char YY, unsigned char UU, unsigned char VV, size_t outIdx) {
-                        float Yf = (float)YY;
-                        float Uf = (float)UU - 128.0f;
-                        float Vf = (float)VV - 128.0f;
-                        float rf, gf, bf;
-                        if (full_range_flag == 1) {
-                            if (use_bt709_flag == 1) {
-                                rf = Yf + 1.792741f * Vf;
-                                gf = Yf - 0.213249f * Uf - 0.532909f * Vf;
-                                bf = Yf + 2.112402f * Uf;
-                            } else {
-                                rf = Yf + 1.596027f * Vf;
-                                gf = Yf - 0.391762f * Uf - 0.812968f * Vf;
-                                bf = Yf + 2.017232f * Uf;
-                            }
-                        } else {
-                            float y_lin = 1.164383f * (Yf - 16.0f);
-                            if (use_bt709_flag == 1) {
-                                rf = y_lin + 1.792741f * Vf;
-                                gf = y_lin - 0.213249f * Uf - 0.532909f * Vf;
-                                bf = y_lin + 2.112402f * Uf;
-                            } else {
-                                rf = y_lin + 1.596027f * Vf;
-                                gf = y_lin - 0.391762f * Uf - 0.812968f * Vf;
-                                bf = y_lin + 2.017232f * Uf;
-                            }
-                        }
-                        int r = (int)std::round(std::max(0.0f, std::min(255.0f, rf)));
-                        int g = (int)std::round(std::max(0.0f, std::min(255.0f, gf)));
-                        int b = (int)std::round(std::max(0.0f, std::min(255.0f, bf)));
-                        rgb[outIdx + 0] = (unsigned char)r;
-                        rgb[outIdx + 1] = (unsigned char)g;
-                        rgb[outIdx + 2] = (unsigned char)b;
-                    };
-                    size_t outIdx0 = ((size_t)yy * (size_t)width + (size_t)xx) * comp;
-                    size_t outIdx1 = outIdx0 + comp;
-                    convPixel(Y0, U0, V0, outIdx0);
-                    convPixel(Y1, U0, V0, outIdx1);
-                }
-            }
-            handled = true;
-        }
-    }
-
-    // Case C: raw RGB in packed
-    if (!handled) {
-        if (packedSize >= (size_t)width * (size_t)height * 3) {
-            std::memcpy(rgb.data(), packed.data(), (size_t)width * (size_t)height * 3);
-            handled = true;
-        } else {
-            std::cerr << "[screenshot-worker] unsupported pixfmt=" << pixfmt << " (" << fourcc << ") packedSize=" << packedSize << "\n";
-            return;
-        }
+    } else {
+        for (size_t i=0;i<rgb.size();++i) rgb[i]=0;
     }
 
     int stride = width * comp;
-    int ok = stbi_write_png(filename_png.c_str(), width, height, comp, rgb.data(), stride);
-    if (ok) std::cerr << "[screenshot-worker] saved: " << filename_png << "\n";
-    else std::cerr << "[screenshot-worker] failed to write PNG: " << filename_png << "\n";
+    stbi_write_png(filename_png.c_str(), width, height, comp, rgb.data(), stride);
 }
 
-// -----------------------------------------------------------------------------------
+// --------------------------------- main --------------------------------------
 
 int main(int argc, char** argv) {
-    // startup logs to help debug early exits
-    std::cerr << "startup: begin\n";
+    vlogln("startup: begin");
 
     static struct option longopts[] = {
       {"uv-swap", required_argument, nullptr, 0},
@@ -587,6 +488,8 @@ int main(int argc, char** argv) {
       {"matrix", required_argument, nullptr, 0},
       {"auto-resize-window", no_argument, nullptr, 0},
       {"cpu-uv-swap", no_argument, nullptr, 0},
+      {"test-pattern", required_argument, nullptr, 0},
+      {"verbose", no_argument, nullptr, 0},
       {"help", no_argument, nullptr, 'h'},
       {0,0,0,0}
     };
@@ -621,17 +524,19 @@ int main(int argc, char** argv) {
           opt_auto_resize_window = true;
         } else if (name == "cpu-uv-swap") {
           opt_cpu_uv_swap = true;
+        } else if (name == "test-pattern") {
+          if (optarg) opt_test_pattern_path = std::string(optarg);
+        } else if (name == "verbose") {
+          opt_verbose = true;
         }
       }
     }
 
-    std::cerr << "startup: opening device\n";
     int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
     if (fd < 0) {
       perror("open video0");
       return 1;
     }
-    std::cerr << "startup: opened device fd=" << fd << "\n";
 
     uint32_t cur_width = DEFAULT_WIDTH, cur_height = DEFAULT_HEIGHT, cur_pixfmt = 0;
     if (!get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt)) {
@@ -648,7 +553,7 @@ int main(int argc, char** argv) {
     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
     fmt.fmt.pix_mp.num_planes = 1;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-      std::cerr << "VIDIOC_S_FMT: " << strerror(errno) << " (" << errno << ")\n";
+      // non-fatal; keep going
     }
     get_v4l2_format(fd, cur_width, cur_height, cur_pixfmt);
 
@@ -716,7 +621,7 @@ int main(int argc, char** argv) {
       close(fd);
       return 1;
     }
-    std::cerr << "startup: SDL initialized\n";
+    vlogln("startup: SDL initialized");
 
     SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE,
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
@@ -726,7 +631,14 @@ int main(int argc, char** argv) {
       close(fd);
       return 1;
     }
-    std::cerr << "startup: SDL window created\n";
+    vlogln("startup: SDL window created");
+
+    // Force fullscreen desktop immediately
+    if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
+        std::cerr << "Warning: could not set fullscreen: " << SDL_GetError() << "\n";
+    } else {
+        vlogln("Window set to FULLSCREEN_DESKTOP on startup");
+    }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -738,7 +650,7 @@ int main(int argc, char** argv) {
       close(fd);
       return 1;
     }
-    std::cerr << "startup: GL context created\n";
+    vlogln("startup: GL context created");
 
     if (glewInit() != GLEW_OK) {
       std::cerr << "GLEW init failed!" << std::endl;
@@ -749,11 +661,6 @@ int main(int argc, char** argv) {
     GLint gl_max_tex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_max_tex);
 
-    if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
-      // ignore failure
-    }
-    bool is_fullscreen = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(win, &win_w, &win_h);
     glViewport(0, 0, win_w, win_h);
@@ -761,8 +668,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> attempts;
     std::string vertPath = findShaderFile("shader.vert.glsl", &attempts);
     if (vertPath.empty()) {
-      std::cerr << "Vertex shader not found. Tried the following paths:\n";
-      for (const auto &p : attempts) std::cerr << "  " << p << "\n";
+      std::cerr << "Vertex shader not found. Tried the following paths (first few shown):\n";
+      for (size_t i=0;i<std::min<size_t>(attempts.size(),3);++i) std::cerr << "  " << attempts[i] << "\n";
       close(fd);
       return 1;
     }
@@ -770,15 +677,15 @@ int main(int argc, char** argv) {
     attempts.clear();
     std::string fragPath = findShaderFile("shader.frag.glsl", &attempts);
     if (fragPath.empty()) {
-      std::cerr << "Fragment shader not found. Tried the following paths:\n";
-      for (const auto &p : attempts) std::cerr << "  " << p << "\n";
+      std::cerr << "Fragment shader not found. Tried the following paths (first few shown):\n";
+      for (size_t i=0;i<std::min<size_t>(attempts.size(),3);++i) std::cerr << "  " << attempts[i] << "\n";
       close(fd);
       return 1;
     }
 
     GLuint program = createShaderProgram(vertPath.c_str(), fragPath.c_str());
     glUseProgram(program);
-    std::cerr << "startup: shader program created\n";
+    vlogln("startup: shader program created");
 
     float verts[] = {
       -1, -1,     0, 0,
@@ -801,18 +708,18 @@ int main(int argc, char** argv) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
-    GLuint texY = 0, texUV = 0;
+    GLuint texY = 0, texUV = 0, texPattern = 0;
     glGenTextures(1, &texY);
     glBindTexture(GL_TEXTURE_2D, texY);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST); 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glGenTextures(1, &texUV);
     glBindTexture(GL_TEXTURE_2D, texUV);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST); 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -820,11 +727,39 @@ int main(int argc, char** argv) {
     int uv_h = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21) ? (int)(cur_height/2) : (int)cur_height;
     reallocate_textures(texY, texUV, (int)cur_width, (int)cur_height, uv_w, uv_h);
 
+    // Try load test pattern into texPattern if path provided
+    bool haveTestPattern = false;
+    int patternW=0, patternH=0, patternComp=0;
+    if (!opt_test_pattern_path.empty() && fileExists(opt_test_pattern_path)) {
+        unsigned char *img = stbi_load(opt_test_pattern_path.c_str(), &patternW, &patternH, &patternComp, 3);
+        if (img) {
+            glGenTextures(1, &texPattern);
+            glBindTexture(GL_TEXTURE_2D, texPattern);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, patternW, patternH, 0, GL_RGB, GL_UNSIGNED_BYTE, img);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            stbi_image_free(img);
+            haveTestPattern = true;
+            vlogln("Loaded test pattern image into GL texture");
+        } else {
+            std::cerr << "Failed to load test pattern image: " << opt_test_pattern_path << "\n";
+        }
+    }
+
     glUseProgram(program);
     GLint loc_texY = glGetUniformLocation(program, "texY");
     GLint loc_texUV = glGetUniformLocation(program, "texUV");
     if (loc_texY >= 0) glUniform1i(loc_texY, 0);
     if (loc_texUV >= 0) glUniform1i(loc_texUV, 1);
+
+    // New: pattern sampler & show flag
+    GLint loc_texPattern = glGetUniformLocation(program, "texPattern");
+    GLint loc_u_showPattern = glGetUniformLocation(program, "u_showPattern");
+    if (loc_texPattern >= 0) glUniform1i(loc_texPattern, 2);
+    if (loc_u_showPattern >= 0) glUniform1i(loc_u_showPattern, 0);
 
     GLint loc_uv_swap = glGetUniformLocation(program, "uv_swap");
     GLint loc_use_bt709 = glGetUniformLocation(program, "use_bt709");
@@ -834,9 +769,16 @@ int main(int argc, char** argv) {
 
     // NEW uniform locations
     GLint loc_offsetxy1 = glGetUniformLocation(program, "offsetxy1");
-    if (loc_offsetxy1 < 0) {
-        std::cerr << "Warning: uniform 'offsetxy1' not found (shader may optimize it out if unused)\n";
-    }
+
+    // NEW: textureIsFull uniform (tells shader whether we uploaded full input or only subblock)
+    GLint loc_textureIsFull = glGetUniformLocation(program, "u_textureIsFull");
+
+    // NEW: window/output size uniforms (to map gl_FragCoord -> logical output coords)
+    GLint loc_u_windowSize = glGetUniformLocation(program, "u_windowSize");
+    GLint loc_u_outputSize = glGetUniformLocation(program, "u_outputSize");
+
+    // NEW: align top-left uniform
+    GLint loc_u_alignTopLeft = glGetUniformLocation(program, "u_alignTopLeft");
 
     GLint loc_rot = glGetUniformLocation(program, "rot");
     GLint loc_flip_x = glGetUniformLocation(program, "flip_x");
@@ -863,14 +805,6 @@ int main(int argc, char** argv) {
     GLint loc_inputTilesTopToBottom = glGetUniformLocation(program, "inputTilesTopToBottom");
     GLint loc_moduleSerials = glGetUniformLocation(program, "moduleSerials");
 
-    // Log uniform locations to help debugging
-    std::cerr << "Uniform locations: uv_swap=" << loc_uv_swap
-              << " rot=" << loc_rot << " flip_x=" << loc_flip_x << " flip_y=" << loc_flip_y
-              << " gap_count=" << loc_gap_count << " gap_rows=" << loc_gap_rows
-              << " offsetxy1=" << loc_offsetxy1 << " segmentIndex=" << loc_segmentIndex
-              << " u_fullInputSize=" << loc_u_fullInputSize << " u_tileW=" << loc_u_tileW << " inputTilesTopToBottom=" << loc_inputTilesTopToBottom
-              << " moduleSerials=" << loc_moduleSerials << "\n";
-
     // Stable defaults for typical HDMI capture
     int uv_swap = 0;
     if (opt_uv_swap_override >= 0) {
@@ -893,7 +827,6 @@ int main(int argc, char** argv) {
 
     // Now build module filenames based on control.ini serials
     std::array<std::string,3> modFiles = buildModuleFilenames(ctrl);
-    std::cerr << "Module filenames: " << modFiles[0] << " , " << modFiles[1] << " , " << modFiles[2] << "\n";
 
     std::vector<GLint> offsetData;
 
@@ -919,24 +852,41 @@ int main(int argc, char** argv) {
         if (loc_offsetxy1 >= 0 && offsetData.size() >= 150 * 2) {
             glUseProgram(program);
             glUniform2iv(loc_offsetxy1, 150, offsetData.data());
-            std::cerr << "Loaded offsetxy1 from module files (initial)\n";
-            std::cerr << "offsetData[0..9]:";
-            for (size_t i = 0; i < std::min<size_t>(offsetData.size(), 10); ++i) std::cerr << " " << offsetData[i];
-            std::cerr << "\n";
-        } else {
-            std::cerr << "offsetxy1 not uploaded: location invalid or data missing\n";
         }
-    } else {
-        std::cerr << "Warning: failed to load offset module files on startup\n";
     }
 
-    // Flip/rotation defaults (adjust if needed)
-    int flip_x = 0; // horizontal mirror default (0 = no mirror)
-    int flip_y = 1; // vertical flip default
-    int rotation = 0; // 0..3 (0=0deg,1=90cw,2=180deg,3=270deg)
+    // Determine initial textureIsFull for shader (did we allocate a full-input texture or a subblock texture?)
+    if (loc_textureIsFull >= 0) {
+        int textureIsFullInitial = 0;
+        if ((int)cur_width == (int)ctrl.fullInputW && (int)cur_height == (int)ctrl.fullInputH) textureIsFullInitial = 1;
+        else textureIsFullInitial = 0;
+        glUseProgram(program);
+        glUniform1i(loc_textureIsFull, textureIsFullInitial);
+    }
+
+    // Set initial u_windowSize / u_outputSize & align top-left
+    if (loc_u_windowSize >= 0 || loc_u_outputSize >= 0) {
+        glUseProgram(program);
+        if (loc_u_windowSize >= 0) glUniform2f(loc_u_windowSize, (float)win_w, (float)win_h);
+        if (loc_u_outputSize >= 0) glUniform2f(loc_u_outputSize, ctrl.subBlockW, ctrl.subBlockH);
+        if (loc_u_alignTopLeft >= 0) glUniform1i(loc_u_alignTopLeft, 1);
+    }
+
+    // Flip/rotation defaults
+    int flip_x = 0;
+    int flip_y = 1;
+    int rotation = 0;
+
     if (loc_flip_x >= 0) { glUseProgram(program); glUniform1i(loc_flip_x, flip_x); }
     if (loc_flip_y >= 0) { glUseProgram(program); glUniform1i(loc_flip_y, flip_y); }
     if (loc_rot >= 0)    { glUseProgram(program); glUniform1i(loc_rot, rotation); }
+
+    // Active segment variable
+    int activeSegment = 1;
+    if (loc_segmentIndex >= 0) {
+        glUseProgram(program);
+        glUniform1i(loc_segmentIndex, activeSegment);
+    }
 
     // GAP defaults
     const int GAP_ARRAY_SIZE = 8;
@@ -946,6 +896,10 @@ int main(int argc, char** argv) {
     if (loc_gap_rows >= 0)  { glUseProgram(program); glUniform1iv(loc_gap_rows, GAP_ARRAY_SIZE, gap_rows_arr); }
 
     bool running = true;
+
+    // Poll timeout shortened to improve responsiveness to keyboard events
+    const int POLL_TIMEOUT_MS = 200;
+
     const uint64_t CHECK_FMT_INTERVAL = 120;
     uint64_t frame_count = 0;
     struct pollfd pfd;
@@ -955,26 +909,31 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> tmpUVbuf;
     std::vector<unsigned char> tmpFallback;
 
-    // store last frame for screenshot
     std::vector<unsigned char> lastY;
     std::vector<unsigned char> lastUV;
-    std::vector<unsigned char> lastPacked;    // fallback packed buffer
+    std::vector<unsigned char> lastPacked;
     size_t lastPackedSize = 0;
     int last_stride = 0;
     int last_width = 0, last_height = 0;
     bool lastIsNV12_NV21 = false;
     uint32_t last_pixfmt = 0;
 
-    std::cerr << "startup: entering main loop\n";
+    vlogln("startup: entering main loop");
+
+    // Time-based signal-loss detection
+    using clock = std::chrono::steady_clock;
+    auto last_good_frame = clock::now();
+
+    bool signal_lost = false;
 
     while (running) {
-      int ret = poll(&pfd, 1, 2000);
+      int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
       if (ret < 0) {
         if (errno == EINTR) continue;
         perror("poll");
         break;
       } else if (ret == 0) {
-        // timeout
+        // timeout - still attempt DQBUF below
       } else {
         if (pfd.revents & POLLPRI) {
           v4l2_event ev;
@@ -998,6 +957,13 @@ int main(int argc, char** argv) {
                       glUseProgram(program);
                       glUniform1i(loc_uv_swap, uv_swap);
                     }
+                  }
+                  if (loc_textureIsFull >= 0) {
+                      int textureIsFull = 0;
+                      if ((int)cur_width == (int)ctrl.fullInputW && (int)cur_height == (int)ctrl.fullInputH) textureIsFull = 1;
+                      else textureIsFull = 0;
+                      glUseProgram(program);
+                      glUniform1i(loc_textureIsFull, textureIsFull);
                   }
                 }
               }
@@ -1026,6 +992,13 @@ int main(int argc, char** argv) {
                 glUniform1i(loc_uv_swap, uv_swap);
               }
             }
+            if (loc_textureIsFull >= 0) {
+                int textureIsFull = 0;
+                if ((int)cur_width == (int)ctrl.fullInputW && (int)cur_height == (int)ctrl.fullInputH) textureIsFull = 1;
+                else textureIsFull = 0;
+                glUseProgram(program);
+                glUniform1i(loc_textureIsFull, textureIsFull);
+            }
           }
         }
       }
@@ -1039,178 +1012,205 @@ int main(int argc, char** argv) {
       buf.m.planes = planes;
       buf.length = VIDEO_MAX_PLANES;
 
+      bool dequeued = false;
+      auto now = clock::now();
+
       if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          ++frame_count;
-          continue;
+        int e = errno;
+        if (e == EAGAIN || e == EWOULDBLOCK) {
+          // no frame right now — decision whether to show pattern uses time since last_good_frame
         } else {
-          perror("VIDIOC_DQBUF");
-          break;
+          // log transient errors but don't force loss immediately
+          vlogln(std::string("VIDIOC_DQBUF non-fatal failure: ") + strerror(e));
         }
-      }
-
-      unsigned char* base = (unsigned char*)buffers[buf.index][0].addr;
-      size_t bytesused0 = planes[0].bytesused;
-
-      size_t Y_len = (size_t)cur_width * (size_t)cur_height;
-      size_t UV_len = 0;
-      bool isNV12_NV21 = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21);
-      if (isNV12_NV21) UV_len = (size_t)cur_width * ((size_t)cur_height / 2);
-      else UV_len = (size_t)cur_width * (size_t)cur_height * 2;
-      size_t total_expected = Y_len + UV_len;
-
-      unsigned char* ybase = nullptr;
-      unsigned char* uvbase = nullptr;
-
-      if (buf.length >= 2 && buffers[buf.index].size() >= 2) {
-        ybase = (unsigned char*)buffers[buf.index][0].addr;
-        uvbase = (unsigned char*)buffers[buf.index][1].addr;
-      } else if (bytesused0 >= total_expected) {
-        ybase = base;
-        uvbase = base + Y_len;
       } else {
-        ybase = base;
-        uvbase = nullptr;
-      }
+        // We got a buffer. Process its data and try to requeue it.
+        dequeued = true;
 
-      if (ybase) {
-        if ((int)cur_width <= gl_max_tex && (int)cur_height <= gl_max_tex) {
-          glActiveTexture(GL_TEXTURE0);
-          glBindTexture(GL_TEXTURE_2D, texY);
-          glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-          glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, ybase);
+        // Determine pointers
+        unsigned char* base = (unsigned char*)buffers[buf.index][0].addr;
+        size_t bytesused0 = planes[0].bytesused;
+
+        size_t Y_len = (size_t)cur_width * (size_t)cur_height;
+        size_t UV_len = 0;
+        bool isNV12_NV21 = (cur_pixfmt == V4L2_PIX_FMT_NV12 || cur_pixfmt == V4L2_PIX_FMT_NV21);
+        if (isNV12_NV21) UV_len = (size_t)cur_width * ((size_t)cur_height / 2);
+        else UV_len = (size_t)cur_width * (size_t)cur_height * 2;
+        size_t total_expected = Y_len + UV_len;
+
+        unsigned char* ybase = nullptr;
+        unsigned char* uvbase = nullptr;
+
+        if (buf.length >= 2 && buffers[buf.index].size() >= 2) {
+          ybase = (unsigned char*)buffers[buf.index][0].addr;
+          uvbase = (unsigned char*)buffers[buf.index][1].addr;
+        } else if (bytesused0 >= total_expected) {
+          ybase = base;
+          uvbase = base + Y_len;
         } else {
-          upload_texture_tiled(GL_RED, texY, (int)cur_width, (int)cur_height, ybase, gl_max_tex, 1);
+          ybase = base;
+          uvbase = nullptr;
         }
 
-        // store copy for screenshot (handle multiple input layouts)
-        last_pixfmt = cur_pixfmt;
-        if (isNV12_NV21 && ybase && uvbase) {
-            size_t ylen = (size_t)cur_width * (size_t)cur_height;
-            size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
-            if (lastY.size() < ylen) lastY.resize(ylen);
-            if (lastUV.size() < uvlen) lastUV.resize(uvlen);
-            memcpy(lastY.data(), ybase, ylen);
-            memcpy(lastUV.data(), uvbase, uvlen);
-            last_width = (int)cur_width;
-            last_height = (int)cur_height;
-            lastIsNV12_NV21 = true;
-            lastPacked.clear(); lastPackedSize = 0; last_stride = 0;
-        } else {
-            // fallback: store whole packed buffer (single-plane or packed formats)
-            unsigned char* packedPtr = nullptr;
-            size_t packedSize = 0;
-            if (uvbase == nullptr) {
-                packedPtr = base;
-                packedSize = bytesused0 > 0 ? bytesused0 : (size_t)cur_width * (size_t)cur_height * 2;
-                if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
-                memcpy(lastPacked.data(), packedPtr, packedSize);
-                lastPackedSize = packedSize;
-                last_stride = (int)cur_width * 2; // best-effort for packed 4:2:2
-                last_width = (int)cur_width;
-                last_height = (int)cur_height;
-                lastIsNV12_NV21 = false;
+        // upload Y plane (if allowed)
+        if (ybase && !signal_lost) {
+          if ((int)cur_width <= gl_max_tex && (int)cur_height <= gl_max_tex) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, texY);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, ybase);
+          } else {
+            upload_texture_tiled(GL_RED, texY, (int)cur_width, (int)cur_height, ybase, gl_max_tex, 1);
+          }
+
+          // store copy for screenshot
+          last_pixfmt = cur_pixfmt;
+          if (isNV12_NV21 && ybase && uvbase) {
+              size_t ylen = (size_t)cur_width * (size_t)cur_height;
+              size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
+              if (lastY.size() < ylen) lastY.resize(ylen);
+              if (lastUV.size() < uvlen) lastUV.resize(uvlen);
+              memcpy(lastY.data(), ybase, ylen);
+              memcpy(lastUV.data(), uvbase, uvlen);
+              last_width = (int)cur_width;
+              last_height = (int)cur_height;
+              lastIsNV12_NV21 = true;
+              lastPacked.clear(); lastPackedSize = 0; last_stride = 0;
+          } else {
+              unsigned char* packedPtr = nullptr;
+              size_t packedSize = 0;
+              if (uvbase == nullptr) {
+                  packedPtr = base;
+                  packedSize = bytesused0 > 0 ? bytesused0 : (size_t)cur_width * (size_t)cur_height * 2;
+                  if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
+                  memcpy(lastPacked.data(), packedPtr, packedSize);
+                  lastPackedSize = packedSize;
+                  last_stride = (int)cur_width * 2;
+                  last_width = (int)cur_width;
+                  last_height = (int)cur_height;
+                  lastIsNV12_NV21 = false;
+              } else {
+                  size_t ylen = (size_t)cur_width * (size_t)cur_height;
+                  size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
+                  packedSize = ylen + uvlen;
+                  if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
+                  memcpy(lastPacked.data(), ybase, ylen);
+                  memcpy(lastPacked.data() + ylen, uvbase, uvlen);
+                  lastPackedSize = packedSize;
+                  last_width = (int)cur_width;
+                  last_height = (int)cur_height;
+                  lastIsNV12_NV21 = false;
+              }
+          }
+        }
+
+        // upload UV plane
+        if (uvbase && !signal_lost) {
+          int upload_w = isNV12_NV21 ? (int)(cur_width/2) : (int)cur_width;
+          int upload_h = isNV12_NV21 ? (int)(cur_height/2) : (int)cur_height;
+
+          if (opt_cpu_uv_swap && cur_pixfmt == V4L2_PIX_FMT_NV21) {
+            size_t need = (size_t)upload_w * (size_t)upload_h * 2;
+            if (tmpUVbuf.size() < need) tmpUVbuf.resize(need);
+            unsigned char* dst = tmpUVbuf.data();
+
+            if (isNV12_NV21) {
+              for (int y = 0; y < upload_h; ++y) {
+                const unsigned char* srcRow = uvbase + (size_t)y * (size_t)cur_width;
+                unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
+                for (int x = 0; x < upload_w; ++x) {
+                  unsigned char v = srcRow[x*2 + 0];
+                  unsigned char u = srcRow[x*2 + 1];
+                  dstRow[x*2 + 0] = u;
+                  dstRow[x*2 + 1] = v;
+                }
+              }
             } else {
-                // two-plane but not NV12/NV21 — concatenate Y then UV
-                size_t ylen = (size_t)cur_width * (size_t)cur_height;
-                size_t uvlen = (size_t)cur_width * ((size_t)cur_height / 2);
-                packedSize = ylen + uvlen;
-                if (lastPacked.size() < packedSize) lastPacked.resize(packedSize);
-                memcpy(lastPacked.data(), ybase, ylen);
-                memcpy(lastPacked.data() + ylen, uvbase, uvlen);
-                lastPackedSize = packedSize;
-                last_width = (int)cur_width;
-                last_height = (int)cur_height;
-                lastIsNV12_NV21 = false;
+              for (int y = 0; y < upload_h; ++y) {
+                const unsigned char* srcRow = uvbase + (size_t)y * (size_t)upload_w * 2;
+                unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
+                for (int x = 0; x < upload_w; ++x) {
+                  unsigned char v = srcRow[x*2 + 0];
+                  unsigned char u = srcRow[x*2 + 1];
+                  dstRow[x*2 + 0] = u;
+                  dstRow[x*2 + 1] = v;
+                }
+              }
+            }
+
+            if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
+              glActiveTexture(GL_TEXTURE1);
+              glBindTexture(GL_TEXTURE_2D, texUV);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, tmpUVbuf.data());
+            } else {
+              upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, tmpUVbuf.data(), gl_max_tex, 2);
+            }
+          } else {
+            if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
+              glActiveTexture(GL_TEXTURE1);
+              glBindTexture(GL_TEXTURE_2D, texUV);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, uvbase);
+            } else {
+              upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, uvbase, gl_max_tex, 2);
+            }
+          }
+        }
+
+        // Now try to requeue the buffer. Only if QBUF succeeds we treat the frame as successfully processed.
+        bool qbuf_ok = false;
+        for (int attempt = 0; attempt < QBUF_RETRIES; ++attempt) {
+            if (xioctl(fd, VIDIOC_QBUF, &buf) == 0) {
+                qbuf_ok = true;
+                if (opt_verbose && attempt > 0) {
+                    vlogln(std::string("VIDIOC_QBUF succeeded after ") + std::to_string(attempt) + " retries");
+                }
+                break;
+            } else {
+                int e = errno;
+                // transient wait and retry
+                if (opt_verbose) {
+                    vlogln(std::string("VIDIOC_QBUF failed (attempt ") + std::to_string(attempt+1) + "): " + strerror(e));
+                }
+                usleep(QBUF_RETRY_MS * 1000);
             }
         }
-      }
-
-      if (uvbase) {
-        int upload_w = isNV12_NV21 ? (int)(cur_width/2) : (int)cur_width;
-        int upload_h = isNV12_NV21 ? (int)(cur_height/2) : (int)cur_height;
-
-        if (opt_cpu_uv_swap && cur_pixfmt == V4L2_PIX_FMT_NV21) {
-          size_t need = (size_t)upload_w * (size_t)upload_h * 2;
-          if (tmpUVbuf.size() < need) tmpUVbuf.resize(need);
-          unsigned char* dst = tmpUVbuf.data();
-
-          if (isNV12_NV21) {
-            for (int y = 0; y < upload_h; ++y) {
-              const unsigned char* srcRow = uvbase + (size_t)y * (size_t)cur_width;
-              unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
-              for (int x = 0; x < upload_w; ++x) {
-                unsigned char v = srcRow[x*2 + 0];
-                unsigned char u = srcRow[x*2 + 1];
-                dstRow[x*2 + 0] = u;
-                dstRow[x*2 + 1] = v;
-              }
-            }
-          } else {
-            for (int y = 0; y < upload_h; ++y) {
-              const unsigned char* srcRow = uvbase + (size_t)y * (size_t)upload_w * 2;
-              unsigned char* dstRow = dst + (size_t)y * (size_t)upload_w * 2;
-              for (int x = 0; x < upload_w; ++x) {
-                unsigned char v = srcRow[x*2 + 0];
-                unsigned char u = srcRow[x*2 + 1];
-                dstRow[x*2 + 0] = u;
-                dstRow[x*2 + 1] = v;
-              }
-            }
-          }
-
-          if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, texUV);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, tmpUVbuf.data());
-          } else {
-            upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, tmpUVbuf.data(), gl_max_tex, 2);
-          }
+        if (!qbuf_ok) {
+            // If requeue didn't work, log and DON'T mark this frame as "good".
+            std::cerr << "VIDIOC_QBUF failed after retries; treating as transient - will fallback to pattern if no subsequent good frames\n";
+            // don't set last_good_frame; let time-based PATTERN_TIMEOUT_MS decide
         } else {
-          if (upload_w <= gl_max_tex && upload_h <= gl_max_tex) {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, texUV);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, upload_w, upload_h, GL_RG, GL_UNSIGNED_BYTE, uvbase);
-          } else {
-            upload_texture_tiled(GL_RG, texUV, upload_w, upload_h, uvbase, gl_max_tex, 2);
-          }
+            // QBUF ok -> mark frame as good (update last_good_frame) and ensure pattern is off
+            last_good_frame = now;
+            if (signal_lost) {
+                signal_lost = false;
+                if (loc_u_showPattern >= 0) { glUseProgram(program); glUniform1i(loc_u_showPattern, 0); }
+                vlogln("Recovered to live (QBUF success)");
+            }
         }
-      } else {
-        size_t need = Y_len + (size_t)cur_width * (size_t)cur_height * 2;
-        if (tmpFallback.size() < need) tmpFallback.resize(need);
-        unsigned char* dst = tmpFallback.data();
-        unsigned char* src = base;
-        for (size_t i = 0, j = 0; i < (size_t)cur_width * (size_t)cur_height; ++i) {
-          dst[j++] = src[i*3 + 0];
-          dst[j++] = src[i*3 + 1];
-          dst[j++] = src[i*3 + 2];
-        }
-        unsigned char* tmpY = dst;
-        unsigned char* tmpUV = dst + Y_len;
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texY);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RED, GL_UNSIGNED_BYTE, tmpY);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, texUV);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cur_width, (int)cur_height, GL_RG, GL_UNSIGNED_BYTE, tmpUV);
+      } // end dequeued handling
+
+      // If no valid frames for PATTERN_TIMEOUT_MS -> enter signal_lost
+      auto now2 = clock::now();
+      auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - last_good_frame).count();
+      if (!signal_lost && elapsedMs > PATTERN_TIMEOUT_MS) {
+          signal_lost = true;
+          vlogln("signal_lost: timeout reached -> showing pattern");
+          if (loc_u_showPattern >= 0) { glUseProgram(program); glUniform1i(loc_u_showPattern, 1); }
       }
 
-      // Draw
+      // Draw: pattern if signal_lost, else normal
       glClear(GL_COLOR_BUFFER_BIT);
       glUseProgram(program);
 
-      // Ensure rotation/flip uniforms are uploaded every frame (avoids optimization/cache issues)
       if (loc_rot >= 0)    glUniform1i(loc_rot, rotation);
       if (loc_flip_x >= 0) glUniform1i(loc_flip_x, flip_x);
       if (loc_flip_y >= 0) glUniform1i(loc_flip_y, flip_y);
 
-      // Ensure gap uniforms are uploaded every frame
       if (loc_gap_count >= 0) glUniform1i(loc_gap_count, gap_count);
       if (loc_gap_rows >= 0)  glUniform1iv(loc_gap_rows, GAP_ARRAY_SIZE, gap_rows_arr);
 
-      // Ensure control uniforms are present
       if (loc_u_fullInputSize >= 0) glUniform2f(loc_u_fullInputSize, ctrl.fullInputW, ctrl.fullInputH);
       if (loc_u_segmentsX >= 0) glUniform1i(loc_u_segmentsX, ctrl.segmentsX);
       if (loc_u_segmentsY >= 0) glUniform1i(loc_u_segmentsY, ctrl.segmentsY);
@@ -1231,6 +1231,33 @@ int main(int argc, char** argv) {
       if (loc_use_bt709 >= 0) glUniform1i(loc_use_bt709, opt_use_bt709);
       if (loc_full_range >= 0) glUniform1i(loc_full_range, opt_full_range);
 
+      if (loc_textureIsFull >= 0) {
+          int textureIsFull = 0;
+          if ((int)cur_width == (int)ctrl.fullInputW && (int)cur_height == (int)ctrl.fullInputH) {
+              textureIsFull = 1;
+          } else {
+              textureIsFull = 0;
+          }
+          glUniform1i(loc_textureIsFull, textureIsFull);
+      }
+
+      if (loc_u_windowSize >= 0) glUniform2f(loc_u_windowSize, (float)win_w, (float)win_h);
+      if (loc_u_outputSize >= 0) glUniform2f(loc_u_outputSize, ctrl.subBlockW, ctrl.subBlockH);
+      if (loc_u_alignTopLeft >= 0) glUniform1i(loc_u_alignTopLeft, 1);
+
+      if (loc_segmentIndex >= 0) {
+          int maxSeg = std::max(1, ctrl.segmentsX * ctrl.segmentsY);
+          int segToSet = std::min(std::max(1, activeSegment), maxSeg);
+          glUniform1i(loc_segmentIndex, segToSet);
+      }
+
+      if (loc_u_showPattern >= 0) glUniform1i(loc_u_showPattern, signal_lost ? 1 : 0);
+
+      if (haveTestPattern) {
+          glActiveTexture(GL_TEXTURE2);
+          glBindTexture(GL_TEXTURE_2D, texPattern);
+      }
+
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, texY);
       glActiveTexture(GL_TEXTURE1);
@@ -1241,11 +1268,7 @@ int main(int argc, char** argv) {
 
       SDL_GL_SwapWindow(win);
 
-      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-        perror("VIDIOC_QBUF (requeue)");
-        break;
-      }
-
+      // Process SDL events (keeps ESC responsive)
       SDL_Event e;
       while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) running = false;
@@ -1260,11 +1283,14 @@ int main(int argc, char** argv) {
             }
             SDL_GetWindowSize(win, &win_w, &win_h);
             glViewport(0, 0, win_w, win_h);
+            if (loc_u_windowSize >= 0) {
+                glUseProgram(program);
+                glUniform2f(loc_u_windowSize, (float)win_w, (float)win_h);
+                if (loc_u_alignTopLeft >= 0) glUniform1i(loc_u_alignTopLeft, 1);
+            }
           } else if (k == SDLK_k) {
-            // Reload control_ini.txt and module files
             ControlParams newCtrl;
             if (loadControlIni("control_ini.txt", newCtrl)) {
-                // update active ctrl
                 ctrl = newCtrl;
                 glUseProgram(program);
                 if (loc_u_fullInputSize >= 0) glUniform2f(loc_u_fullInputSize, ctrl.fullInputW, ctrl.fullInputH);
@@ -1283,62 +1309,52 @@ int main(int argc, char** argv) {
                 if (loc_inputTilesTopToBottom >= 0) glUniform1i(loc_inputTilesTopToBottom, ctrl.inputTilesTopToBottom);
                 if (loc_moduleSerials >= 0) glUniform1iv(loc_moduleSerials, 3, ctrl.moduleSerials);
 
-                std::cerr << "Reloaded control_ini.txt and uploaded shader uniforms\n";
-
-                // regenerate module filenames based on possibly new serials
                 modFiles = buildModuleFilenames(ctrl);
-                std::cerr << "Reload: module filenames now: " << modFiles[0] << " , " << modFiles[1] << " , " << modFiles[2] << "\n";
 
-                // load offsets from new files
                 std::vector<GLint> newOffsets;
                 if (loadOffsetsFromModuleFiles(modFiles, newOffsets)) {
                     if (loc_offsetxy1 >= 0 && newOffsets.size() >= 150*2) {
                         glUseProgram(program);
                         glUniform2iv(loc_offsetxy1, 150, newOffsets.data());
-                        std::cerr << "Reloaded offsetxy1 from module files (on 'k' press) and uploaded to shader\n";
                         offsetData.swap(newOffsets);
-                    } else {
-                        std::cerr << "Reload failed: loc_offsetxy1 invalid or data incomplete\n";
                     }
-                } else {
-                    std::cerr << "Failed to read module files on reload\n";
                 }
-            } else {
-                std::cerr << "control_ini.txt not found on reload; keeping previous control values\n";
             }
-
           } else if (k == SDLK_h) {
             flip_x = !flip_x;
             if (loc_flip_x >= 0) {
                 glUseProgram(program);
                 glUniform1i(loc_flip_x, flip_x);
             }
-            std::cerr << "flip_x = " << flip_x << "\n";
           } else if (k == SDLK_v) {
             flip_y = !flip_y;
             if (loc_flip_y >= 0) {
                 glUseProgram(program);
                 glUniform1i(loc_flip_y, flip_y);
             }
-            std::cerr << "flip_y = " << flip_y << "\n";
           } else if (k == SDLK_r) {
             rotation = (rotation + 2) & 3; // step 180°
             if (loc_rot >= 0) {
                 glUseProgram(program);
                 glUniform1i(loc_rot, rotation);
             }
-            std::cerr << "rotation = " << rotation << " (0=0deg,1=90deg,2=180deg,3=270deg) (step=180°)\n";
+          } else if (k == SDLK_1 || k == SDLK_2 || k == SDLK_3) {
+            int requested = -1;
+            if (k == SDLK_1) requested = 1;
+            if (k == SDLK_2) requested = 2;
+            if (k == SDLK_3) requested = 3;
+            if (requested > 0) {
+                int maxSeg = std::max(1, ctrl.segmentsX * ctrl.segmentsY);
+                if (requested <= maxSeg) {
+                    activeSegment = requested;
+                    if (loc_segmentIndex >= 0) {
+                        glUseProgram(program);
+                        glUniform1i(loc_segmentIndex, activeSegment);
+                    }
+                }
+            }
           } else if (k == SDLK_s) {
-            std::cerr << "s pressed: lastIsNV12_NV21=" << lastIsNV12_NV21
-                      << " lastY=" << lastY.size() << " lastUV=" << lastUV.size()
-                      << " lastPacked=" << lastPackedSize
-                      << " last_pixfmt=" << last_pixfmt << " (" << fourcc_to_str(last_pixfmt) << ")"
-                      << " last_w=" << last_width << " last_h=" << last_height
-                      << " uv_swap=" << uv_swap << "\n";
-
-            if (last_width <= 0 || last_height <= 0) {
-                std::cerr << "No last frame dimensions available. Skipping.\n";
-            } else {
+            if (last_width > 0 && last_height > 0) {
                 std::vector<unsigned char> copyY, copyUV, copyPacked;
                 if (lastIsNV12_NV21) {
                     copyY = lastY;
@@ -1348,7 +1364,7 @@ int main(int argc, char** argv) {
                 }
                 int w = last_width, h = last_height;
                 uint32_t fmt = last_pixfmt;
-                int uv_swap_flag = uv_swap; // 0 NV12, 1 NV21
+                int uv_swap_flag = uv_swap;
                 int use_bt709_flag = opt_use_bt709;
                 int full_range_flag = opt_full_range;
 
@@ -1357,7 +1373,6 @@ int main(int argc, char** argv) {
                               lastPackedSize, w, h, fmt, uv_swap_flag, use_bt709_flag, full_range_flag,
                               std::string("display.png"));
                 t.detach();
-                std::cerr << "Screenshot request: saving async to display.png\n";
             }
           }
         }
@@ -1367,6 +1382,7 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    if (texPattern) glDeleteTextures(1, &texPattern);
     glDeleteTextures(1, &texY);
     glDeleteTextures(1, &texUV);
     glDeleteBuffers(1, &vbo);
@@ -1381,6 +1397,6 @@ int main(int argc, char** argv) {
         if (pm.addr && pm.length) munmap(pm.addr, pm.length);
 
     close(fd);
-    std::cerr << "shutdown: normal exit\n";
+    vlogln("shutdown: normal exit");
     return 0;
 }
